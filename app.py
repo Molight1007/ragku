@@ -57,122 +57,256 @@ async def index() -> dict:
 
 @app.get("/chat-ui", response_class=HTMLResponse)
 async def chat_ui() -> str:
-    """简单的中文网页聊天界面。"""
+    """千问风格的中文网页聊天界面。"""
     return """
 <!DOCTYPE html>
 <html lang="zh-CN">
 <head>
     <meta charset="UTF-8" />
-    <title>本地知识库RAG问答系统</title>
+    <title>本地知识库问答系统</title>
     <style>
+        * {
+            box-sizing: border-box;
+        }
         body {
-            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+            font-family: "Microsoft YaHei", "微软雅黑", sans-serif;
             margin: 0;
-            padding: 0;
-            background: #f5f5f7;
+            background: #f2f2f3;
+            color: #1f2330;
         }
-        .container {
-            max-width: 960px;
+        .page {
+            min-height: 100vh;
+            max-width: 980px;
             margin: 0 auto;
-            padding: 24px 16px 40px;
+            padding: 24px 20px 36px;
+            display: flex;
+            flex-direction: column;
         }
-        h1 {
-            font-size: 24px;
-            margin-bottom: 8px;
+        .top-tools {
+            display: flex;
+            justify-content: flex-end;
+            margin-bottom: 28px;
         }
-        .subtitle {
-            color: #666;
-            font-size: 14px;
-            margin-bottom: 16px;
+        .clear-btn {
+            border: 1px solid #d9dbe2;
+            background: #ffffff;
+            color: #4a4f5d;
+            border-radius: 999px;
+            font-size: 13px;
+            padding: 8px 14px;
+            cursor: pointer;
+            box-shadow: 0 2px 6px rgba(28, 39, 64, 0.06);
+        }
+        .welcome {
+            text-align: center;
+            font-size: 42px;
+            font-weight: 600;
+            letter-spacing: 1px;
+            margin-top: 40px;
+            margin-bottom: 26px;
         }
         .chat-box {
-            background: #ffffff;
-            border-radius: 12px;
-            padding: 16px;
-            height: 480px;
+            flex: 1;
+            display: block;
             overflow-y: auto;
-            box-shadow: 0 8px 24px rgba(0,0,0,0.06);
+            padding: 0;
+            border-radius: 0;
+            background: transparent;
+            box-shadow: none;
+            transition: padding 0.2s ease;
+        }
+        .chat-box.active {
+            padding: 10px 10px 16px;
+            border-radius: 16px;
+            background: rgba(255, 255, 255, 0.38);
+            box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.6);
         }
         .msg {
-            margin-bottom: 16px;
+            margin-bottom: 12px;
+            display: flex;
+            align-items: flex-start;
+            gap: 8px;
         }
         .msg-user {
-            text-align: right;
+            justify-content: flex-end;
+        }
+        .msg-bot {
+            justify-content: flex-start;
+        }
+        .avatar {
+            width: 30px;
+            height: 30px;
+            border-radius: 50%;
+            flex-shrink: 0;
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 13px;
+            font-weight: 700;
+        }
+        .avatar-bot {
+            background: #e8ebf2;
+            color: #374151;
+        }
+        .avatar-user {
+            background: #d8e5ff;
+            color: #355ddf;
+        }
+        .bubble {
+            max-width: min(82%, 880px);
+            padding: 10px 13px;
+            border-radius: 12px;
+            line-height: 1.6;
+            font-size: 14px;
+            white-space: pre-wrap;
+            word-break: break-word;
         }
         .msg-user .bubble {
-            display: inline-block;
-            background: #1677ff;
+            background: #8eaefb;
             color: #fff;
-            padding: 8px 12px;
-            border-radius: 16px 4px 16px 16px;
-            max-width: 70%;
+            border-radius: 12px 12px 4px 12px;
+            box-shadow: 0 3px 10px rgba(120, 149, 230, 0.20);
         }
         .msg-bot .bubble {
-            display: inline-block;
-            background: #f0f0f0;
-            color: #222;
-            padding: 8px 12px;
-            border-radius: 4px 16px 16px 16px;
-            max-width: 80%;
+            background: #fcfcfd;
+            color: #1f2937;
+            border: 1px solid #e4e6eb;
+            border-radius: 4px 12px 12px 12px;
+            box-shadow: 0 2px 8px rgba(33, 43, 60, 0.06);
         }
         .contexts {
             margin-top: 8px;
-            padding-left: 16px;
+            padding: 8px 10px;
+            background: #f7f8fb;
+            border: 1px solid #eceef3;
+            border-radius: 10px;
             font-size: 12px;
-            color: #555;
-            border-left: 2px solid #ddd;
+            color: #4b5563;
         }
-        .input-area {
-            margin-top: 16px;
+        .composer-wrap {
+            margin-top: 12px;
+        }
+        .composer {
             display: flex;
-            gap: 8px;
+            align-items: flex-end;
+            gap: 10px;
+            background: #f7f7f8;
+            border: 1px solid #dcdee4;
+            border-radius: 28px;
+            box-shadow: 0 10px 24px rgba(50, 59, 81, 0.08), 0 2px 6px rgba(50, 59, 81, 0.05);
+            padding: 8px 14px;
         }
-        .input-area textarea {
+        .question-input {
             flex: 1;
-            resize: none;
-            border-radius: 8px;
-            border: 1px solid #d9d9d9;
-            padding: 8px;
-            font-size: 14px;
-        }
-        .input-area button {
-            width: 96px;
+            width: 100%;
             border: none;
-            border-radius: 8px;
-            background: #1677ff;
-            color: #fff;
-            font-size: 14px;
-            cursor: pointer;
+            outline: none;
+            background: transparent;
+            font-size: 16px;
+            line-height: 1.4;
+            min-height: 40px;
+            max-height: 220px;
+            resize: none;
+            overflow-y: auto;
+            font-family: inherit;
+            color: #1f2330;
         }
-        .input-area button:disabled {
-            background: #b0c7f5;
+        .question-input::placeholder {
+            font-size: inherit;
+            color: #b6b9c3;
+            font-weight: 500;
+        }
+        .composer-bottom {
+            margin-top: 0;
+            display: flex;
+            align-items: center;
+            justify-content: flex-end;
+        }
+        .send-btn {
+            width: 40px;
+            height: 40px;
+            border: none;
+            border-radius: 999px;
+            background: #bfd0f8;
+            color: #fff;
+            font-size: 18px;
+            font-weight: 700;
+            cursor: pointer;
+            flex-shrink: 0;
+            box-shadow: 0 4px 10px rgba(106, 138, 220, 0.28);
+        }
+        .send-btn:disabled {
+            background: #cad8fb;
             cursor: not-allowed;
         }
         .status {
             margin-top: 8px;
             font-size: 12px;
-            color: #888;
+            color: #7a808f;
+            text-align: center;
+        }
+        @media (max-width: 900px) {
+            .page {
+                padding: 16px 12px 24px;
+            }
+            .welcome {
+                font-size: 30px;
+                margin-top: 26px;
+            }
+            .question-input {
+                font-size: 16px;
+            }
         }
     </style>
 </head>
 <body>
-    <div class="container">
-        <h1>本地知识库RAG问答系统</h1>
-        <div class="subtitle">
-            基于阿里云通义千问 + 本地多模态知识库 · 支持中文问答与溯源展示
+    <div class="page">
+        <div class="top-tools">
+            <button class="clear-btn" onclick="resetChat()">新对话</button>
         </div>
+        <div class="welcome" id="welcomeText">你好，欢迎使用知识库问答</div>
         <div class="chat-box" id="chatBox"></div>
-        <div class="input-area">
-            <textarea id="questionInput" rows="3" placeholder="请输入你的问题，例如：根据知识库介绍一下项目背景和主要内容"></textarea>
-            <button id="sendBtn" onclick="sendQuestion()">发送</button>
+        <div class="composer-wrap">
+            <div class="composer">
+                <textarea id="questionInput" class="question-input" rows="1" placeholder="请输入你的问题"></textarea>
+                <div class="composer-bottom">
+                    <button id="sendBtn" class="send-btn" onclick="sendQuestion()">↑</button>
+                </div>
+            </div>
+            <div class="status" id="statusText">就绪</div>
         </div>
-        <div class="status" id="statusText">就绪</div>
     </div>
     <script>
         const chatBox = document.getElementById('chatBox');
         const questionInput = document.getElementById('questionInput');
         const sendBtn = document.getElementById('sendBtn');
         const statusText = document.getElementById('statusText');
+        const welcomeText = document.getElementById('welcomeText');
+
+        function setStatus(text) {
+            statusText.textContent = text;
+        }
+
+        function autoResizeInput() {
+            questionInput.style.height = 'auto';
+            questionInput.style.height = Math.min(questionInput.scrollHeight, 220) + 'px';
+        }
+
+        function setChatBoxActive(active) {
+            chatBox.classList.toggle('active', active);
+        }
+
+        function createAvatar(role) {
+            const avatar = document.createElement('span');
+            if (role === 'user') {
+                avatar.className = 'avatar avatar-user';
+                avatar.textContent = '我';
+            } else {
+                avatar.className = 'avatar avatar-bot';
+                avatar.textContent = '助';
+            }
+            return avatar;
+        }
 
         function appendMessage(role, text, contexts) {
             const wrap = document.createElement('div');
@@ -181,29 +315,48 @@ async def chat_ui() -> str:
             const bubble = document.createElement('div');
             bubble.className = 'bubble';
             bubble.textContent = text;
-            wrap.appendChild(bubble);
 
-            if (role === 'bot' && Array.isArray(contexts) && contexts.length > 0) {
-                const ctxDiv = document.createElement('div');
-                ctxDiv.className = 'contexts';
-                ctxDiv.innerHTML = '<strong>参考片段：</strong><br>' + contexts.map((c, idx) =>
-                    `【${idx + 1}】来源：${c.source}<br/>预览：${c.text_preview}`
-                ).join('<br><br>');
-                wrap.appendChild(ctxDiv);
+            if (role === 'user') {
+                wrap.appendChild(bubble);
+                wrap.appendChild(createAvatar(role));
+            } else {
+                wrap.appendChild(createAvatar(role));
+                const contentWrap = document.createElement('div');
+                contentWrap.style.maxWidth = 'calc(100% - 40px)';
+                contentWrap.appendChild(bubble);
+
+                if (Array.isArray(contexts) && contexts.length > 0) {
+                    const ctxDiv = document.createElement('div');
+                    ctxDiv.className = 'contexts';
+                    ctxDiv.innerHTML = '<strong>参考片段</strong><br>' + contexts.map((c, idx) =>
+                        `【${idx + 1}】来源：${c.source}<br/>相关度：${Number(c.score || 0).toFixed(3)}<br/>预览：${c.text_preview}`
+                    ).join('<br><br>');
+                    contentWrap.appendChild(ctxDiv);
+                }
+                wrap.appendChild(contentWrap);
             }
 
             chatBox.appendChild(wrap);
             chatBox.scrollTop = chatBox.scrollHeight;
         }
 
+        function resetChat() {
+            chatBox.innerHTML = '';
+            setChatBoxActive(false);
+            welcomeText.style.display = 'block';
+            setStatus('就绪');
+        }
+
         async function sendQuestion() {
             const q = questionInput.value.trim();
             if (!q) return;
 
+            welcomeText.style.display = 'none';
             appendMessage('user', q);
             questionInput.value = '';
+            autoResizeInput();
             sendBtn.disabled = true;
-            statusText.textContent = '正在向后端检索知识并生成回答，请稍候…';
+            setStatus('检索中');
 
             try {
                 const resp = await fetch('/chat', {
@@ -212,16 +365,20 @@ async def chat_ui() -> str:
                     body: JSON.stringify({ question: q })
                 });
                 if (!resp.ok) {
-                    throw new Error('HTTP ' + resp.status);
+                    throw new Error('请求失败，状态码：' + resp.status);
                 }
                 const data = await resp.json();
                 appendMessage('bot', data.answer || '后端未返回回答。', data.contexts || []);
+                setChatBoxActive(true);
+                setStatus('完成');
             } catch (err) {
                 console.error(err);
                 appendMessage('bot', '请求后端失败，请检查服务是否在运行，或稍后再试。', []);
+                setChatBoxActive(true);
+                setStatus('异常');
             } finally {
                 sendBtn.disabled = false;
-                statusText.textContent = '就绪';
+                setTimeout(() => setStatus('就绪'), 800);
             }
         }
 
@@ -231,6 +388,10 @@ async def chat_ui() -> str:
                 sendQuestion();
             }
         });
+        questionInput.addEventListener('input', autoResizeInput);
+
+        resetChat();
+        autoResizeInput();
     </script>
 </body>
 </html>
