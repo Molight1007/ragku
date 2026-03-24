@@ -1,0 +1,10 @@
+dashscope>=1.16.0
+python-dotenv>=1.0.1
+numpy>=1.26.0
+PyPDF2>=3.0.1
+python-docx>=1.1.0
+pillow>=10.3.0
+pytesseract>=0.3.10
+fastapi>=0.115.0
+uvicorn[standard]>=0.32.0
+pyinstaller>=6.5.0
