@@ -221,6 +221,71 @@ async def chat_ui() -> str:
             display: flex;
             align-items: center;
             justify-content: flex-end;
+            gap: 8px;
+            position: relative;
+        }
+        .plus-wrap {
+            position: relative;
+            display: inline-flex;
+            align-items: center;
+        }
+        .plus-btn {
+            width: 40px;
+            height: 40px;
+            border: 1px solid #d7dbe6;
+            border-radius: 999px;
+            background: #ffffff;
+            color: #5d6473;
+            font-size: 24px;
+            line-height: 1;
+            cursor: pointer;
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            box-shadow: 0 4px 10px rgba(33, 43, 60, 0.10);
+        }
+        .plus-menu {
+            position: absolute;
+            right: 0;
+            bottom: calc(100% + 10px);
+            min-width: 210px;
+            background: #ffffff;
+            border: 1px solid #e5e7ee;
+            border-radius: 16px;
+            box-shadow: 0 14px 24px rgba(33, 43, 60, 0.12);
+            overflow: hidden;
+            display: none;
+            z-index: 20;
+        }
+        .plus-menu.show {
+            display: block;
+        }
+        .plus-item {
+            width: 100%;
+            border: none;
+            background: #fff;
+            color: #1f2330;
+            text-align: left;
+            padding: 12px 14px;
+            font-size: 15px;
+            cursor: pointer;
+            display: inline-flex;
+            align-items: center;
+            gap: 10px;
+        }
+        .plus-item + .plus-item {
+            border-top: 1px solid #edf0f5;
+        }
+        .plus-item:hover {
+            background: #f8f9fc;
+        }
+        .plus-icon {
+            width: 18px;
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            color: #4b5563;
+            font-size: 16px;
         }
         .send-btn {
             width: 40px;
@@ -270,6 +335,14 @@ async def chat_ui() -> str:
             <div class="composer">
                 <textarea id="questionInput" class="question-input" rows="1" placeholder="请输入你的问题"></textarea>
                 <div class="composer-bottom">
+                    <div class="plus-wrap">
+                        <button id="plusBtn" class="plus-btn" type="button" aria-label="更多功能">+</button>
+                        <div id="plusMenu" class="plus-menu">
+                            <button class="plus-item" type="button"><span class="plus-icon">📷</span>拍照识文字</button>
+                            <button class="plus-item" type="button"><span class="plus-icon">🖼</span>图片识文字</button>
+                            <button class="plus-item" type="button"><span class="plus-icon">📎</span>文件</button>
+                        </div>
+                    </div>
                     <button id="sendBtn" class="send-btn" onclick="sendQuestion()">↑</button>
                 </div>
             </div>
@@ -282,6 +355,8 @@ async def chat_ui() -> str:
         const sendBtn = document.getElementById('sendBtn');
         const statusText = document.getElementById('statusText');
         const welcomeText = document.getElementById('welcomeText');
+        const plusBtn = document.getElementById('plusBtn');
+        const plusMenu = document.getElementById('plusMenu');
 
         function setStatus(text) {
             statusText.textContent = text;
@@ -290,6 +365,10 @@ async def chat_ui() -> str:
         function autoResizeInput() {
             questionInput.style.height = 'auto';
             questionInput.style.height = Math.min(questionInput.scrollHeight, 220) + 'px';
+        }
+
+        function hidePlusMenu() {
+            plusMenu.classList.remove('show');
         }
 
         function setChatBoxActive(active) {
@@ -343,6 +422,7 @@ async def chat_ui() -> str:
         function resetChat() {
             chatBox.innerHTML = '';
             setChatBoxActive(false);
+            hidePlusMenu();
             welcomeText.style.display = 'block';
             setStatus('就绪');
         }
@@ -389,6 +469,18 @@ async def chat_ui() -> str:
             }
         });
         questionInput.addEventListener('input', autoResizeInput);
+        plusBtn.addEventListener('click', function (e) {
+            e.stopPropagation();
+            plusMenu.classList.toggle('show');
+        });
+        document.addEventListener('click', function (e) {
+            if (!plusMenu.contains(e.target) && e.target !== plusBtn) {
+                hidePlusMenu();
+            }
+        });
+        plusMenu.addEventListener('click', function () {
+            hidePlusMenu();
+        });
 
         resetChat();
         autoResizeInput();
