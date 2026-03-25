@@ -689,8 +689,8 @@ async def chat_ui() -> str:
         </div>
     </aside>
     <input type="file" id="fileCamera" accept="image/*" capture="environment" style="display:none" />
-    <input type="file" id="fileImage" accept="image/*" style="display:none" />
-    <input type="file" id="fileDoc" accept=".txt,.md,.pdf,.docx,.jpg,.jpeg,.png,.bmp,.webp,.gif" style="display:none" />
+    <input type="file" id="fileImage" accept="image/*" multiple style="display:none" />
+    <input type="file" id="fileDoc" accept=".txt,.md,.pdf,.docx,.jpg,.jpeg,.png,.bmp,.webp,.gif" multiple style="display:none" />
     <script>
         const chatBox = document.getElementById('chatBox');
         const questionInput = document.getElementById('questionInput');
@@ -712,7 +712,7 @@ async def chat_ui() -> str:
         const historyList = document.getElementById('historyList');
 
         const STORAGE_KEY = 'ragku_chat_sessions_v1';
-        let pendingAttachment = null;
+        let pendingAttachments = [];
         let chatInFlight = false;
         let chatAbortController = null;
         let chatCancelReason = null;
@@ -913,7 +913,7 @@ async def chat_ui() -> str:
             chatAbortController = null;
             chatCancelReason = null;
             setSendBtnBusy(false);
-            clearPendingAttachment();
+            clearPendingAttachments();
             hidePlusMenu();
             currentSessionId = sess.id;
             sessionMessages = JSON.parse(JSON.stringify(sess.messages));
@@ -928,69 +928,99 @@ async def chat_ui() -> str:
             setTimeout(function () { setStatus('就绪'); }, 600);
         }
 
-        function revokePendingPreview() {
-            if (pendingAttachment && pendingAttachment.previewUrl) {
-                URL.revokeObjectURL(pendingAttachment.previewUrl);
+        function revokeAttachmentPreview(item) {
+            if (item && item.previewUrl) {
+                URL.revokeObjectURL(item.previewUrl);
             }
+        }
+
+        function removePendingAttachmentAt(index) {
+            if (index < 0 || index >= pendingAttachments.length) return;
+            revokeAttachmentPreview(pendingAttachments[index]);
+            pendingAttachments.splice(index, 1);
+            renderAttachmentStrip();
+        }
+
+        function clearPendingAttachments() {
+            for (var i = 0; i < pendingAttachments.length; i++) {
+                revokeAttachmentPreview(pendingAttachments[i]);
+            }
+            pendingAttachments = [];
+            renderAttachmentStrip();
+        }
+
+        function addPendingFromFile(file, text) {
+            var t = (text || '').trim();
+            var isImg = !!(file.type && file.type.indexOf('image/') === 0) ||
+                /\\.(jpe?g|png|gif|webp|bmp)$/i.test(file.name || '');
+            var previewUrl = isImg ? URL.createObjectURL(file) : null;
+            pendingAttachments.push({
+                text: t,
+                name: file.name || '附件',
+                previewUrl: previewUrl,
+                kind: isImg ? 'image' : 'file'
+            });
+            renderAttachmentStrip();
+        }
+
+        function buildAttachmentPayload() {
+            var chunks = [];
+            for (var i = 0; i < pendingAttachments.length; i++) {
+                var item = pendingAttachments[i];
+                var txt = (item.text || '').trim();
+                if (!txt) continue;
+                chunks.push('【' + (item.name || ('附件' + (i + 1))) + '】\\n' + txt);
+            }
+            return chunks.join('\\n\\n');
+        }
+
+        function buildAttachmentCaption() {
+            if (!pendingAttachments.length) return '';
+            if (pendingAttachments.length === 1) return pendingAttachments[0].name || '附件';
+            return pendingAttachments.length + ' 个附件';
         }
 
         function renderAttachmentStrip() {
             if (!attachmentStrip) return;
             attachmentStrip.innerHTML = '';
             attachmentStrip.classList.remove('has-items');
-            if (!pendingAttachment) return;
+            if (!pendingAttachments.length) return;
             attachmentStrip.classList.add('has-items');
-            var chip = document.createElement('div');
-            chip.className = 'attachment-chip';
-            if (pendingAttachment.kind === 'image' && pendingAttachment.previewUrl) {
-                var img = document.createElement('img');
-                img.className = 'attachment-thumb';
-                img.alt = '';
-                img.src = pendingAttachment.previewUrl;
-                chip.appendChild(img);
-            } else {
-                var ph = document.createElement('div');
-                ph.className = 'attachment-thumb file-icon';
-                ph.textContent = '📄';
-                chip.appendChild(ph);
+            for (var i = 0; i < pendingAttachments.length; i++) {
+                (function (idx) {
+                    var item = pendingAttachments[idx];
+                    var chip = document.createElement('div');
+                    chip.className = 'attachment-chip';
+                    if (item.kind === 'image' && item.previewUrl) {
+                        var img = document.createElement('img');
+                        img.className = 'attachment-thumb';
+                        img.alt = '';
+                        img.src = item.previewUrl;
+                        chip.appendChild(img);
+                    } else {
+                        var ph = document.createElement('div');
+                        ph.className = 'attachment-thumb file-icon';
+                        ph.textContent = '📄';
+                        chip.appendChild(ph);
+                    }
+                    var meta = document.createElement('span');
+                    meta.className = 'attachment-meta';
+                    meta.textContent = item.name || '附件';
+                    chip.appendChild(meta);
+                    var rm = document.createElement('button');
+                    rm.type = 'button';
+                    rm.className = 'attachment-remove';
+                    rm.setAttribute('aria-label', '移除附件');
+                    rm.textContent = '×';
+                    rm.addEventListener('click', function (e) {
+                        e.preventDefault();
+                        removePendingAttachmentAt(idx);
+                        setStatus('已移除附件');
+                    });
+                    chip.appendChild(rm);
+                    attachmentStrip.appendChild(chip);
+                })(i);
             }
-            var meta = document.createElement('span');
-            meta.className = 'attachment-meta';
-            meta.textContent = pendingAttachment.name || '附件';
-            chip.appendChild(meta);
-            var rm = document.createElement('button');
-            rm.type = 'button';
-            rm.className = 'attachment-remove';
-            rm.setAttribute('aria-label', '移除附件');
-            rm.textContent = '×';
-            rm.addEventListener('click', function (e) {
-                e.preventDefault();
-                clearPendingAttachment();
-                setStatus('已移除附件');
-            });
-            chip.appendChild(rm);
-            attachmentStrip.appendChild(chip);
-        }
-
-        function clearPendingAttachment() {
-            revokePendingPreview();
-            pendingAttachment = null;
-            renderAttachmentStrip();
-        }
-
-        function setPendingFromFile(file, text) {
-            var t = (text || '').trim();
-            var isImg = !!(file.type && file.type.indexOf('image/') === 0) ||
-                /\\.(jpe?g|png|gif|webp|bmp)$/i.test(file.name || '');
-            revokePendingPreview();
-            var previewUrl = isImg ? URL.createObjectURL(file) : null;
-            pendingAttachment = {
-                text: t,
-                name: file.name || '附件',
-                previewUrl: previewUrl,
-                kind: isImg ? 'image' : 'file'
-            };
-            renderAttachmentStrip();
         }
 
         async function postOcrImage(file) {
@@ -1013,7 +1043,7 @@ async def chat_ui() -> str:
                 const msg = (data && data.detail) ? (Array.isArray(data.detail) ? data.detail[0].msg : data.detail) : ('HTTP ' + resp.status);
                 throw new Error(msg);
             }
-            setPendingFromFile(file, data.text);
+            addPendingFromFile(file, data.text);
             if (!(data.text || '').trim()) {
                 setStatus('未识别到文字，已关联图片；可输入问题后发送（仅发送您输入的内容）');
             } else {
@@ -1041,7 +1071,7 @@ async def chat_ui() -> str:
                 const msg = (data && data.detail) ? (Array.isArray(data.detail) ? data.detail[0].msg : data.detail) : ('HTTP ' + resp.status);
                 throw new Error(msg);
             }
-            setPendingFromFile(file, data.text);
+            addPendingFromFile(file, data.text);
             if (!(data.text || '').trim()) {
                 setStatus('未提取到文本；文件已关联，可输入问题后发送（仅发送您输入的内容）');
             } else {
@@ -1122,7 +1152,7 @@ async def chat_ui() -> str:
             if (chatBox) chatBox.innerHTML = '';
             setChatBoxActive(false);
             hidePlusMenu();
-            clearPendingAttachment();
+            clearPendingAttachments();
             if (welcomeText) welcomeText.style.display = 'block';
             setStatus('就绪');
         }
@@ -1137,7 +1167,7 @@ async def chat_ui() -> str:
                 return;
             }
             const q = questionInput.value.trim();
-            const attachPayload = pendingAttachment ? (pendingAttachment.text || '').trim() : '';
+            const attachPayload = buildAttachmentPayload();
             if (!q && !attachPayload) {
                 setStatus('请输入问题，或先上传并完成识别后再发送');
                 try { questionInput.focus(); } catch (e) {}
@@ -1146,10 +1176,11 @@ async def chat_ui() -> str:
 
             if (welcomeText) welcomeText.style.display = 'none';
             var userShow = q;
-            if (pendingAttachment && pendingAttachment.name) {
+            var attachCaption = buildAttachmentCaption();
+            if (attachCaption) {
                 userShow = q
-                    ? (q + '\\n（附件：' + pendingAttachment.name + '）')
-                    : ('（附件：' + pendingAttachment.name + '）');
+                    ? (q + '\\n（附件：' + attachCaption + '）')
+                    : ('（附件：' + attachCaption + '）');
             }
             appendMessage('user', userShow);
             questionInput.value = '';
@@ -1167,7 +1198,7 @@ async def chat_ui() -> str:
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json' },
                         signal: chatAbortController.signal,
-                        body: JSON.stringify({ question: q, attachment_text: pendingAttachment ? (pendingAttachment.text || '') : '' })
+                        body: JSON.stringify({ question: q, attachment_text: attachPayload })
                     });
                 } catch (err) {
                     if (err && err.name === 'AbortError') {
@@ -1182,7 +1213,7 @@ async def chat_ui() -> str:
                 appendMessage('bot', data.answer || '后端未返回回答。', data.contexts || []);
                 setChatBoxActive(true);
                 setStatus('完成');
-                clearPendingAttachment();
+                clearPendingAttachments();
             } catch (err) {
                 if (err && err.name === 'AbortError') {
                     const reason = chatCancelReason;
@@ -1296,26 +1327,36 @@ async def chat_ui() -> str:
             }
         });
         if (fileImage) fileImage.addEventListener('change', async function (e) {
-            const f = e.target.files && e.target.files[0];
+            const files = Array.from((e.target.files || []));
             e.target.value = '';
-            if (!f) return;
-            try {
-                await postOcrImage(f);
-            } catch (err) {
-                console.error(err);
-                setStatus('识别失败：' + (err.message || err));
+            if (!files.length) return;
+            var ok = 0;
+            for (var i = 0; i < files.length; i++) {
+                try {
+                    await postOcrImage(files[i]);
+                    ok++;
+                } catch (err) {
+                    console.error(err);
+                    setStatus('第 ' + (i + 1) + ' 张识别失败：' + (err.message || err));
+                }
             }
+            if (ok > 0) setStatus('已导入 ' + ok + ' 张图片');
         });
         if (fileDoc) fileDoc.addEventListener('change', async function (e) {
-            const f = e.target.files && e.target.files[0];
+            const files = Array.from((e.target.files || []));
             e.target.value = '';
-            if (!f) return;
-            try {
-                await postUploadFile(f);
-            } catch (err) {
-                console.error(err);
-                setStatus('上传失败：' + (err.message || err));
+            if (!files.length) return;
+            var ok = 0;
+            for (var i = 0; i < files.length; i++) {
+                try {
+                    await postUploadFile(files[i]);
+                    ok++;
+                } catch (err) {
+                    console.error(err);
+                    setStatus('第 ' + (i + 1) + ' 个文件上传失败：' + (err.message || err));
+                }
             }
+            if (ok > 0) setStatus('已导入 ' + ok + ' 个文件');
         });
 
         resetChat();
