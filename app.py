@@ -177,8 +177,112 @@ async def chat_ui() -> str:
         }
         .top-tools {
             display: flex;
-            justify-content: flex-end;
+            justify-content: space-between;
+            align-items: center;
             margin-bottom: 28px;
+        }
+        .menu-btn {
+            border: 1px solid #d9dbe2;
+            background: #ffffff;
+            color: #4a4f5d;
+            border-radius: 10px;
+            width: 42px;
+            height: 42px;
+            padding: 0;
+            cursor: pointer;
+            box-shadow: 0 2px 6px rgba(28, 39, 64, 0.06);
+            display: inline-flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            gap: 5px;
+            flex-shrink: 0;
+        }
+        .menu-btn:hover {
+            background: #f8f9fc;
+        }
+        .menu-btn .bar {
+            display: block;
+            width: 18px;
+            height: 2px;
+            background: #4a4f5d;
+            border-radius: 1px;
+        }
+        .history-overlay {
+            position: fixed;
+            inset: 0;
+            background: rgba(55, 60, 72, 0.38);
+            z-index: 1000;
+            opacity: 0;
+            visibility: hidden;
+            transition: opacity 0.22s ease, visibility 0.22s ease;
+        }
+        .history-overlay.open {
+            opacity: 1;
+            visibility: visible;
+        }
+        .history-drawer {
+            position: fixed;
+            top: 0;
+            left: 0;
+            bottom: 0;
+            width: min(82vw, 340px);
+            max-width: 380px;
+            background: #ffffff;
+            z-index: 1001;
+            box-shadow: 8px 0 32px rgba(28, 39, 64, 0.12);
+            transform: translateX(-102%);
+            transition: transform 0.26s cubic-bezier(0.22, 1, 0.36, 1);
+            display: flex;
+            flex-direction: column;
+        }
+        .history-drawer.open {
+            transform: translateX(0);
+        }
+        .history-drawer-inner {
+            flex: 1;
+            min-height: 0;
+            display: flex;
+            flex-direction: column;
+            padding: 20px 0 20px;
+        }
+        .history-drawer-title {
+            font-size: 17px;
+            font-weight: 700;
+            color: #1f2330;
+            padding: 0 20px 16px;
+            border-bottom: 1px solid #eef0f5;
+        }
+        .history-list {
+            flex: 1;
+            overflow-y: auto;
+            padding: 12px 0 8px;
+        }
+        .history-item {
+            width: 100%;
+            border: none;
+            background: transparent;
+            text-align: left;
+            padding: 12px 20px;
+            font-size: 15px;
+            color: #1f2330;
+            cursor: pointer;
+            font-family: inherit;
+            line-height: 1.45;
+            transition: background 0.15s ease;
+        }
+        .history-item:hover {
+            background: #f3f5fa;
+        }
+        .history-item.active {
+            background: #e8edfb;
+            color: #355ddf;
+        }
+        .history-empty {
+            padding: 24px 20px;
+            font-size: 14px;
+            color: #9ca3af;
+            text-align: center;
         }
         .clear-btn {
             border: 1px solid #d9dbe2;
@@ -521,7 +625,12 @@ async def chat_ui() -> str:
 <body>
     <div class="page">
         <div class="top-tools">
-            <button class="clear-btn" onclick="resetChat()">新对话</button>
+            <button type="button" id="menuBtn" class="menu-btn" aria-label="打开历史对话" title="历史对话">
+                <span class="bar"></span>
+                <span class="bar"></span>
+                <span class="bar"></span>
+            </button>
+            <button type="button" class="clear-btn" onclick="resetChat()">新对话</button>
         </div>
         <div class="welcome" id="welcomeText">你好，欢迎使用知识库问答</div>
         <div class="chat-box" id="chatBox"></div>
@@ -546,6 +655,13 @@ async def chat_ui() -> str:
             <div class="status" id="statusText">就绪</div>
         </div>
     </div>
+    <div id="historyOverlay" class="history-overlay" aria-hidden="true"></div>
+    <aside id="historyDrawer" class="history-drawer" aria-hidden="true" aria-label="历史对话">
+        <div class="history-drawer-inner">
+            <div class="history-drawer-title">历史对话</div>
+            <div id="historyList" class="history-list"></div>
+        </div>
+    </aside>
     <input type="file" id="fileCamera" accept="image/*" capture="environment" style="display:none" />
     <input type="file" id="fileImage" accept="image/*" style="display:none" />
     <input type="file" id="fileDoc" accept=".txt,.md,.pdf,.docx,.jpg,.jpeg,.png,.bmp,.webp,.gif" style="display:none" />
@@ -564,11 +680,19 @@ async def chat_ui() -> str:
         const fileImage = document.getElementById('fileImage');
         const fileDoc = document.getElementById('fileDoc');
         const attachmentStrip = document.getElementById('attachmentStrip');
+        const menuBtn = document.getElementById('menuBtn');
+        const historyOverlay = document.getElementById('historyOverlay');
+        const historyDrawer = document.getElementById('historyDrawer');
+        const historyList = document.getElementById('historyList');
 
+        const STORAGE_KEY = 'ragku_chat_sessions_v1';
         let pendingAttachment = null;
         let chatInFlight = false;
         let chatAbortController = null;
         let chatCancelReason = null;
+        let currentSessionId = null;
+        let sessionMessages = [];
+        let persistTimer = null;
 
         function apiUrl(path) {
             var base = (window.location.origin && window.location.origin !== 'null')
@@ -611,6 +735,140 @@ async def chat_ui() -> str:
 
         function hidePlusMenu() {
             if (plusMenu) plusMenu.classList.remove('show');
+        }
+
+        function loadAllSessionsFromStorage() {
+            try {
+                var raw = localStorage.getItem(STORAGE_KEY);
+                if (!raw) return [];
+                var arr = JSON.parse(raw);
+                return Array.isArray(arr) ? arr : [];
+            } catch (e) {
+                return [];
+            }
+        }
+
+        function saveAllSessionsToStorage(list) {
+            try {
+                localStorage.setItem(STORAGE_KEY, JSON.stringify(list));
+            } catch (e) {}
+        }
+
+        function persistCurrentSession() {
+            clearTimeout(persistTimer);
+            persistTimer = setTimeout(function () {
+                if (sessionMessages.length === 0) return;
+                if (!currentSessionId) {
+                    currentSessionId = 's_' + Date.now() + '_' + Math.random().toString(36).slice(2, 9);
+                }
+                var title = '新对话';
+                for (var i = 0; i < sessionMessages.length; i++) {
+                    if (sessionMessages[i].role === 'user') {
+                        var t = (sessionMessages[i].text || '').replace(/\\n/g, ' ').trim();
+                        title = t.length > 28 ? t.slice(0, 28) + '…' : (t || '新对话');
+                        break;
+                    }
+                }
+                var all = loadAllSessionsFromStorage();
+                var found = false;
+                var snapshot = JSON.parse(JSON.stringify(sessionMessages));
+                var now = Date.now();
+                for (var j = 0; j < all.length; j++) {
+                    if (all[j].id === currentSessionId) {
+                        all[j] = { id: currentSessionId, title: title, updatedAt: now, messages: snapshot };
+                        found = true;
+                        break;
+                    }
+                }
+                if (!found) {
+                    all.unshift({ id: currentSessionId, title: title, updatedAt: now, messages: snapshot });
+                }
+                all.sort(function (a, b) { return (b.updatedAt || 0) - (a.updatedAt || 0); });
+                saveAllSessionsToStorage(all);
+            }, 80);
+        }
+
+        function closeHistoryDrawer() {
+            if (historyOverlay) {
+                historyOverlay.classList.remove('open');
+                historyOverlay.setAttribute('aria-hidden', 'true');
+            }
+            if (historyDrawer) {
+                historyDrawer.classList.remove('open');
+                historyDrawer.setAttribute('aria-hidden', 'true');
+            }
+        }
+
+        function openHistoryDrawer() {
+            renderHistoryList();
+            if (historyOverlay) {
+                historyOverlay.classList.add('open');
+                historyOverlay.setAttribute('aria-hidden', 'false');
+            }
+            if (historyDrawer) {
+                historyDrawer.classList.add('open');
+                historyDrawer.setAttribute('aria-hidden', 'false');
+            }
+        }
+
+        function renderHistoryList() {
+            if (!historyList) return;
+            historyList.innerHTML = '';
+            var sessions = loadAllSessionsFromStorage().slice();
+            sessions.sort(function (a, b) { return (b.updatedAt || 0) - (a.updatedAt || 0); });
+            if (!sessions.length) {
+                var empty = document.createElement('div');
+                empty.className = 'history-empty';
+                empty.textContent = '暂无历史对话';
+                historyList.appendChild(empty);
+                return;
+            }
+            for (var si = 0; si < sessions.length; si++) {
+                (function (sess) {
+                    var btn = document.createElement('button');
+                    btn.type = 'button';
+                    btn.className = 'history-item' + (sess.id === currentSessionId ? ' active' : '');
+                    btn.textContent = sess.title || '未命名对话';
+                    btn.addEventListener('click', function () {
+                        selectHistorySession(sess.id);
+                        closeHistoryDrawer();
+                    });
+                    historyList.appendChild(btn);
+                })(sessions[si]);
+            }
+        }
+
+        function selectHistorySession(id) {
+            var all = loadAllSessionsFromStorage();
+            var sess = null;
+            for (var i = 0; i < all.length; i++) {
+                if (all[i].id === id) {
+                    sess = all[i];
+                    break;
+                }
+            }
+            if (!sess || !Array.isArray(sess.messages)) return;
+            if (chatInFlight && chatAbortController) {
+                chatCancelReason = 'reset';
+                try { chatAbortController.abort(); } catch (e) {}
+            }
+            chatInFlight = false;
+            chatAbortController = null;
+            chatCancelReason = null;
+            setSendBtnBusy(false);
+            clearPendingAttachment();
+            hidePlusMenu();
+            currentSessionId = sess.id;
+            sessionMessages = JSON.parse(JSON.stringify(sess.messages));
+            if (chatBox) chatBox.innerHTML = '';
+            for (var j = 0; j < sessionMessages.length; j++) {
+                var m = sessionMessages[j];
+                appendMessage(m.role, m.text, m.contexts || [], false);
+            }
+            setChatBoxActive(sessionMessages.length > 0);
+            if (welcomeText) welcomeText.style.display = sessionMessages.length ? 'none' : 'block';
+            setStatus('已载入历史对话');
+            setTimeout(function () { setStatus('就绪'); }, 600);
         }
 
         function revokePendingPreview() {
@@ -750,7 +1008,15 @@ async def chat_ui() -> str:
             return avatar;
         }
 
-        function appendMessage(role, text, contexts) {
+        function appendMessage(role, text, contexts, record) {
+            if (record !== false) {
+                sessionMessages.push({
+                    role: role,
+                    text: text,
+                    contexts: Array.isArray(contexts) ? contexts : []
+                });
+                persistCurrentSession();
+            }
             const wrap = document.createElement('div');
             wrap.className = 'msg ' + (role === 'user' ? 'msg-user' : 'msg-bot');
 
@@ -794,6 +1060,8 @@ async def chat_ui() -> str:
             chatInFlight = false;
             chatAbortController = null;
             setSendBtnBusy(false);
+            currentSessionId = null;
+            sessionMessages = [];
             if (chatBox) chatBox.innerHTML = '';
             setChatBoxActive(false);
             hidePlusMenu();
@@ -880,6 +1148,25 @@ async def chat_ui() -> str:
                 setTimeout(function () { setStatus('就绪'); }, 800);
             }
         }
+
+        if (menuBtn) {
+            menuBtn.addEventListener('click', function (e) {
+                e.preventDefault();
+                e.stopPropagation();
+                hidePlusMenu();
+                openHistoryDrawer();
+            });
+        }
+        if (historyOverlay) {
+            historyOverlay.addEventListener('click', function () {
+                closeHistoryDrawer();
+            });
+        }
+        document.addEventListener('keydown', function (e) {
+            if (e.key === 'Escape') {
+                closeHistoryDrawer();
+            }
+        });
 
         if (sendBtn) {
             sendBtn.addEventListener('click', function (e) {
