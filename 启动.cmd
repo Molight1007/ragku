@@ -2,9 +2,8 @@
 setlocal EnableExtensions
 chcp 65001 >nul 2>&1
 cd /d "%~dp0"
-
-set "ROOT=%~dp0"
-set "LAUNCH=%ROOT%launcher.py"
+set "ROOT=%CD%"
+set "LAUNCH=%ROOT%\launcher.py"
 
 if not exist "%LAUNCH%" (
     echo [错误] 未找到 launcher.py，请将此脚本放在项目根目录。
@@ -14,8 +13,8 @@ if not exist "%LAUNCH%" (
 
 set "PYEXE="
 set "PYWEXE="
-if exist "%ROOT%.venv\Scripts\python.exe" set "PYEXE=%ROOT%.venv\Scripts\python.exe"
-if exist "%ROOT%.venv\Scripts\pythonw.exe" set "PYWEXE=%ROOT%.venv\Scripts\pythonw.exe"
+if exist "%ROOT%\.venv\Scripts\python.exe" set "PYEXE=%ROOT%\.venv\Scripts\python.exe"
+if exist "%ROOT%\.venv\Scripts\pythonw.exe" set "PYWEXE=%ROOT%\.venv\Scripts\pythonw.exe"
 if not defined PYEXE (
     where python >nul 2>&1
     if errorlevel 1 (
@@ -79,14 +78,14 @@ echo.
 goto menu_end
 
 :opt_web
-if not exist "%ROOT%.env" (
+if not exist "%ROOT%\.env" (
     echo.
     echo [提示] 缺少 .env。请先选 [2] 配置密钥，或运行 01_一键配置密钥.cmd
     pause
     goto menu
 )
-if not exist "%ROOT%index_store.npy" goto opt_web_noindex
-if not exist "%ROOT%index_meta.npy" goto opt_web_noindex
+if not exist "%ROOT%\index_store.npy" goto opt_web_noindex
+if not exist "%ROOT%\index_meta.npy" goto opt_web_noindex
 goto opt_web_run
 
 :opt_web_noindex
