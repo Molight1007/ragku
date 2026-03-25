@@ -22,7 +22,8 @@ def _ensure_upload_dir() -> None:
 class ChatRequest(BaseModel):
     """前端发送的问题请求模型。"""
 
-    question: str
+    question: str = ""
+    attachment_text: str = ""
 
 
 class ContextSnippet(BaseModel):
@@ -295,6 +296,75 @@ async def chat_ui() -> str:
             z-index: 21;
             overflow: visible;
         }
+        .composer-main {
+            flex: 1;
+            min-width: 0;
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+            align-items: stretch;
+        }
+        .attachment-strip {
+            display: none;
+            flex-wrap: wrap;
+            align-items: center;
+            gap: 8px;
+            padding: 0 2px;
+        }
+        .attachment-strip.has-items {
+            display: flex;
+        }
+        .attachment-chip {
+            display: inline-flex;
+            align-items: center;
+            gap: 8px;
+            padding: 4px 6px 4px 4px;
+            background: #ffffff;
+            border: 1px solid #e5e7ee;
+            border-radius: 12px;
+            box-shadow: 0 2px 8px rgba(33, 43, 60, 0.06);
+            max-width: 100%;
+        }
+        .attachment-thumb {
+            width: 48px;
+            height: 48px;
+            border-radius: 8px;
+            object-fit: cover;
+            background: #eef0f5;
+            flex-shrink: 0;
+        }
+        .attachment-thumb.file-icon {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 22px;
+            width: 48px;
+            height: 48px;
+        }
+        .attachment-meta {
+            font-size: 13px;
+            color: #4b5563;
+            max-width: 200px;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+        .attachment-remove {
+            width: 28px;
+            height: 28px;
+            border: none;
+            border-radius: 8px;
+            background: transparent;
+            color: #9ca3af;
+            font-size: 18px;
+            line-height: 1;
+            cursor: pointer;
+            flex-shrink: 0;
+        }
+        .attachment-remove:hover {
+            background: #f3f4f6;
+            color: #374151;
+        }
         .question-input {
             flex: 1;
             min-width: 0;
@@ -452,7 +522,10 @@ async def chat_ui() -> str:
         <div class="chat-box" id="chatBox"></div>
         <div class="composer-wrap">
             <div class="composer">
-                <textarea id="questionInput" class="question-input" rows="1" placeholder="请输入你的问题"></textarea>
+                <div class="composer-main">
+                    <div id="attachmentStrip" class="attachment-strip" aria-live="polite"></div>
+                    <textarea id="questionInput" class="question-input" rows="1" placeholder="请输入你的问题"></textarea>
+                </div>
                 <div class="composer-bottom">
                     <div class="plus-wrap">
                         <button id="plusBtn" class="plus-btn" type="button" aria-label="更多功能">+</button>
@@ -485,6 +558,9 @@ async def chat_ui() -> str:
         const fileCamera = document.getElementById('fileCamera');
         const fileImage = document.getElementById('fileImage');
         const fileDoc = document.getElementById('fileDoc');
+        const attachmentStrip = document.getElementById('attachmentStrip');
+
+        let pendingAttachment = null;
 
         function apiUrl(path) {
             var base = (window.location.origin && window.location.origin !== 'null')
@@ -525,16 +601,69 @@ async def chat_ui() -> str:
             if (plusMenu) plusMenu.classList.remove('show');
         }
 
-        function mergeIntoInput(text, hintEmpty) {
-            if (!questionInput) return;
-            const t = (text || '').trim();
-            if (!t) {
-                setStatus(hintEmpty || '未识别到文字');
-                return;
+        function revokePendingPreview() {
+            if (pendingAttachment && pendingAttachment.previewUrl) {
+                URL.revokeObjectURL(pendingAttachment.previewUrl);
             }
-            const cur = questionInput.value.trim();
-            questionInput.value = cur ? (cur + '\\n\\n' + t) : t;
-            autoResizeInput();
+        }
+
+        function renderAttachmentStrip() {
+            if (!attachmentStrip) return;
+            attachmentStrip.innerHTML = '';
+            attachmentStrip.classList.remove('has-items');
+            if (!pendingAttachment) return;
+            attachmentStrip.classList.add('has-items');
+            var chip = document.createElement('div');
+            chip.className = 'attachment-chip';
+            if (pendingAttachment.kind === 'image' && pendingAttachment.previewUrl) {
+                var img = document.createElement('img');
+                img.className = 'attachment-thumb';
+                img.alt = '';
+                img.src = pendingAttachment.previewUrl;
+                chip.appendChild(img);
+            } else {
+                var ph = document.createElement('div');
+                ph.className = 'attachment-thumb file-icon';
+                ph.textContent = '📄';
+                chip.appendChild(ph);
+            }
+            var meta = document.createElement('span');
+            meta.className = 'attachment-meta';
+            meta.textContent = pendingAttachment.name || '附件';
+            chip.appendChild(meta);
+            var rm = document.createElement('button');
+            rm.type = 'button';
+            rm.className = 'attachment-remove';
+            rm.setAttribute('aria-label', '移除附件');
+            rm.textContent = '×';
+            rm.addEventListener('click', function (e) {
+                e.preventDefault();
+                clearPendingAttachment();
+                setStatus('已移除附件');
+            });
+            chip.appendChild(rm);
+            attachmentStrip.appendChild(chip);
+        }
+
+        function clearPendingAttachment() {
+            revokePendingPreview();
+            pendingAttachment = null;
+            renderAttachmentStrip();
+        }
+
+        function setPendingFromFile(file, text) {
+            var t = (text || '').trim();
+            var isImg = !!(file.type && file.type.indexOf('image/') === 0) ||
+                /\\.(jpe?g|png|gif|webp|bmp)$/i.test(file.name || '');
+            revokePendingPreview();
+            var previewUrl = isImg ? URL.createObjectURL(file) : null;
+            pendingAttachment = {
+                text: t,
+                name: file.name || '附件',
+                previewUrl: previewUrl,
+                kind: isImg ? 'image' : 'file'
+            };
+            renderAttachmentStrip();
         }
 
         async function postOcrImage(file) {
@@ -557,8 +686,12 @@ async def chat_ui() -> str:
                 const msg = (data && data.detail) ? (Array.isArray(data.detail) ? data.detail[0].msg : data.detail) : ('HTTP ' + resp.status);
                 throw new Error(msg);
             }
-            mergeIntoInput(data.text, '未识别到文字');
-            setStatus('图片识别完成');
+            setPendingFromFile(file, data.text);
+            if (!(data.text || '').trim()) {
+                setStatus('未识别到文字，已关联图片；可输入问题后发送（仅发送您输入的内容）');
+            } else {
+                setStatus('识别完成，内容将随发送一并提交（未写入输入框）');
+            }
         }
 
         async function postUploadFile(file) {
@@ -581,8 +714,12 @@ async def chat_ui() -> str:
                 const msg = (data && data.detail) ? (Array.isArray(data.detail) ? data.detail[0].msg : data.detail) : ('HTTP ' + resp.status);
                 throw new Error(msg);
             }
-            mergeIntoInput(data.text, '文件中未提取到文本');
-            setStatus('已保存：' + (data.saved_path || '') + '（内容已填入输入框）');
+            setPendingFromFile(file, data.text);
+            if (!(data.text || '').trim()) {
+                setStatus('未提取到文本；文件已关联，可输入问题后发送（仅发送您输入的内容）');
+            } else {
+                setStatus('已解析「' + (file.name || '文件') + '」，内容将随发送一并提交');
+            }
         }
 
         function setChatBoxActive(active) {
@@ -639,6 +776,7 @@ async def chat_ui() -> str:
             if (chatBox) chatBox.innerHTML = '';
             setChatBoxActive(false);
             hidePlusMenu();
+            clearPendingAttachment();
             if (welcomeText) welcomeText.style.display = 'block';
             setStatus('就绪');
         }
@@ -649,14 +787,21 @@ async def chat_ui() -> str:
                 return;
             }
             const q = questionInput.value.trim();
-            if (!q) {
-                setStatus('请输入问题后再发送');
+            const attachPayload = pendingAttachment ? (pendingAttachment.text || '').trim() : '';
+            if (!q && !attachPayload) {
+                setStatus('请输入问题，或先上传并完成识别后再发送');
                 try { questionInput.focus(); } catch (e) {}
                 return;
             }
 
             if (welcomeText) welcomeText.style.display = 'none';
-            appendMessage('user', q);
+            var userShow = q;
+            if (pendingAttachment && pendingAttachment.name) {
+                userShow = q
+                    ? (q + '\\n（附件：' + pendingAttachment.name + '）')
+                    : ('（附件：' + pendingAttachment.name + '）');
+            }
+            appendMessage('user', userShow);
             questionInput.value = '';
             autoResizeInput();
             setSendBtnBusy(true);
@@ -668,7 +813,7 @@ async def chat_ui() -> str:
                     resp = await fetch(apiUrl('/chat'), {
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({ question: q })
+                        body: JSON.stringify({ question: q, attachment_text: pendingAttachment ? (pendingAttachment.text || '') : '' })
                     });
                 } catch (err) {
                     throw new Error(explainFetchError(err));
@@ -680,6 +825,7 @@ async def chat_ui() -> str:
                 appendMessage('bot', data.answer || '后端未返回回答。', data.contexts || []);
                 setChatBoxActive(true);
                 setStatus('完成');
+                clearPendingAttachment();
             } catch (err) {
                 console.error(err);
                 appendMessage('bot', '请求后端失败，请检查服务是否在运行，或稍后再试。', []);
@@ -787,14 +933,25 @@ async def chat_ui() -> str:
     """
 
 
+def _effective_rag_query(question: str, attachment_text: str) -> str:
+    q = (question or "").strip()
+    a = (attachment_text or "").strip()
+    if q and a:
+        return f"{q}\n\n【用户上传/识别内容】\n{a}"
+    if a:
+        return f"【用户上传/识别内容】\n{a}"
+    return q
+
+
 @app.post("/chat", response_model=ChatResponse)
 async def chat(body: ChatRequest) -> ChatResponse:
     """核心聊天接口：接收问题，返回回答和参考片段。"""
-    question = body.question.strip()
-    if not question:
-        return ChatResponse(answer="问题不能为空。", contexts=[])
+    q = (body.question or "").strip()
+    a = (body.attachment_text or "").strip()
+    if not q and not a:
+        return ChatResponse(answer="请输入问题，或先上传文件完成识别后再发送。", contexts=[])
 
-    answer, contexts_raw = rag_answer(question)
+    answer, contexts_raw = rag_answer(_effective_rag_query(q, a))
 
     contexts: List[ContextSnippet] = []
     for c in contexts_raw:
