@@ -1,8 +1,10 @@
 import argparse
 import os
+from http import HTTPStatus
 from pathlib import Path
 from typing import List, Tuple
 
+import dashscope
 import numpy as np
 import pytesseract
 from PIL import Image
@@ -100,8 +102,16 @@ def build_embeddings(docs: List[Tuple[str, str]]) -> Tuple[np.ndarray, List[dict
     if not settings.dashscope_api_key:
         raise RuntimeError("未检测到 DASHSCOPE_API_KEY，请先在环境变量或 .env 中配置。")
 
+    if not docs:
+        raise RuntimeError(
+            "没有可向量化的文本分片。请确认知识库目录下是否有支持的文件，且 PDF/OCR 能提取出文字。"
+        )
+
+    dashscope.api_key = settings.dashscope_api_key
+
     embeddings: List[List[float]] = []
     metadatas: List[dict] = []
+    last_api_hint: str = ""
 
     for idx, (source, text) in enumerate(docs, start=1):
         try:
@@ -109,18 +119,34 @@ def build_embeddings(docs: List[Tuple[str, str]]) -> Tuple[np.ndarray, List[dict
                 model=settings.embedding_model,
                 input=text,
             )
-            vector = resp["output"]["embeddings"][0]["embedding"]
-            embeddings.append(vector)
+            status = getattr(resp, "status_code", None)
+            if status != HTTPStatus.OK:
+                code = getattr(resp, "code", "")
+                msg = getattr(resp, "message", "") or str(resp)
+                last_api_hint = f"status={status}, code={code}, message={msg}"
+                print(f"向量化失败，第 {idx} 条，来源 {source}，{last_api_hint}")
+                continue
+
+            output = resp.output if hasattr(resp, "output") else resp["output"]
+            emb_list = output["embeddings"] if isinstance(output, dict) else output.embeddings
+            vector = emb_list[0]["embedding"] if isinstance(emb_list[0], dict) else emb_list[0].embedding
+            embeddings.append(list(vector))
             metadatas.append({"source": source, "text": text})
         except Exception as e:  # noqa: BLE001
             print(f"向量化失败，第 {idx} 条，来源 {source}，错误: {e}")
+            last_api_hint = str(e)
             continue
 
         if idx % 20 == 0:
             print(f"已完成向量化 {idx} 条文档分片")
 
     if not embeddings:
-        raise RuntimeError("未成功生成任何向量，请检查数据与 API 配置。")
+        detail = f" 最后一条 API 反馈: {last_api_hint}" if last_api_hint else ""
+        raise RuntimeError(
+            "未成功生成任何向量。请检查：1) DASHSCOPE_API_KEY 是否有效、有余额；"
+            f"2) config 中 embedding_model（当前 {settings.embedding_model!r}）是否与控制台可用模型一致；"
+            "3) 本机网络能否访问 DashScope。" + detail
+        )
 
     return np.array(embeddings, dtype="float32"), metadatas
 
@@ -149,6 +175,11 @@ def main() -> None:
     print(f"开始遍历知识库目录: {data_dir}")
     docs = collect_documents(data_dir)
     print(f"完成收集，共得到文档分片数量: {len(docs)}")
+    if not docs:
+        raise RuntimeError(
+            f"知识库目录 {data_dir} 下未产生任何文本分片。"
+            "请检查是否放对了路径、文件格式是否为 .txt/.md/.pdf/.docx/图片等。"
+        )
 
     print("开始生成文本向量……")
     embeddings, metadatas = build_embeddings(docs)

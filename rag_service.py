@@ -57,13 +57,25 @@ def embed_query(query: str) -> np.ndarray:
     if not settings.dashscope_api_key:
         raise RuntimeError("未检测到 DASHSCOPE_API_KEY，请先在环境变量或 .env 中配置。")
 
+    from http import HTTPStatus
+
+    import dashscope
     from dashscope import TextEmbedding  # 延迟导入，避免不必要依赖
 
+    dashscope.api_key = settings.dashscope_api_key
     resp = TextEmbedding.call(
         model=settings.embedding_model,
         input=query,
     )
-    vector = resp["output"]["embeddings"][0]["embedding"]
+    if getattr(resp, "status_code", None) != HTTPStatus.OK:
+        code = getattr(resp, "code", "")
+        msg = getattr(resp, "message", "") or str(resp)
+        raise RuntimeError(f"查询向量化失败: status={resp.status_code}, code={code}, message={msg}")
+
+    output = resp.output if hasattr(resp, "output") else resp["output"]
+    emb_list = output["embeddings"] if isinstance(output, dict) else output.embeddings
+    first = emb_list[0]
+    vector = first["embedding"] if isinstance(first, dict) else first.embedding
     return np.array(vector, dtype="float32")
 
 
@@ -98,6 +110,9 @@ def generate_answer(prompt: str) -> str:
     if not settings.dashscope_api_key:
         raise RuntimeError("未检测到 DASHSCOPE_API_KEY，请先在环境变量或 .env 中配置。")
 
+    import dashscope
+
+    dashscope.api_key = settings.dashscope_api_key
     resp = Generation.call(
         model=settings.llm_model,
         prompt=prompt,
