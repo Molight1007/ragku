@@ -949,18 +949,39 @@ async def chat_ui() -> str:
             renderAttachmentStrip();
         }
 
-        function addPendingFromFile(file, text) {
-            var t = (text || '').trim();
+        function enqueuePendingFile(file, processingText) {
             var isImg = !!(file.type && file.type.indexOf('image/') === 0) ||
                 /\\.(jpe?g|png|gif|webp|bmp)$/i.test(file.name || '');
             var previewUrl = isImg ? URL.createObjectURL(file) : null;
-            pendingAttachments.push({
-                text: t,
+            var item = {
+                text: '',
                 name: file.name || '附件',
                 previewUrl: previewUrl,
-                kind: isImg ? 'image' : 'file'
-            });
+                kind: isImg ? 'image' : 'file',
+                processing: true,
+                processingText: processingText || '处理中…'
+            };
+            pendingAttachments.push(item);
             renderAttachmentStrip();
+            return item;
+        }
+
+        function finishPendingFile(item, text) {
+            if (!item) return;
+            item.text = (text || '').trim();
+            item.processing = false;
+            item.processingText = '';
+            renderAttachmentStrip();
+        }
+
+        function failPendingFile(item, msg) {
+            if (!item) return;
+            item.processing = false;
+            item.processingText = '';
+            item.text = '';
+            item.name = (item.name || '附件') + '（失败）';
+            renderAttachmentStrip();
+            if (msg) setStatus(msg);
         }
 
         function buildAttachmentPayload() {
@@ -1005,7 +1026,7 @@ async def chat_ui() -> str:
                     }
                     var meta = document.createElement('span');
                     meta.className = 'attachment-meta';
-                    meta.textContent = item.name || '附件';
+                    meta.textContent = item.processing ? (item.processingText || '处理中…') : (item.name || '附件');
                     chip.appendChild(meta);
                     var rm = document.createElement('button');
                     rm.type = 'button';
@@ -1023,7 +1044,7 @@ async def chat_ui() -> str:
             }
         }
 
-        async function postOcrImage(file) {
+        async function postOcrImage(file, pendingItem) {
             setStatus('识别图片中…');
             const fd = new FormData();
             fd.append('file', file, file.name);
@@ -1043,7 +1064,7 @@ async def chat_ui() -> str:
                 const msg = (data && data.detail) ? (Array.isArray(data.detail) ? data.detail[0].msg : data.detail) : ('HTTP ' + resp.status);
                 throw new Error(msg);
             }
-            addPendingFromFile(file, data.text);
+            finishPendingFile(pendingItem, data.text);
             if (!(data.text || '').trim()) {
                 setStatus('未识别到文字，已关联图片；可输入问题后发送（仅发送您输入的内容）');
             } else {
@@ -1051,7 +1072,7 @@ async def chat_ui() -> str:
             }
         }
 
-        async function postUploadFile(file) {
+        async function postUploadFile(file, pendingItem) {
             setStatus('上传并解析文件…');
             const fd = new FormData();
             fd.append('file', file, file.name);
@@ -1071,7 +1092,7 @@ async def chat_ui() -> str:
                 const msg = (data && data.detail) ? (Array.isArray(data.detail) ? data.detail[0].msg : data.detail) : ('HTTP ' + resp.status);
                 throw new Error(msg);
             }
-            addPendingFromFile(file, data.text);
+            finishPendingFile(pendingItem, data.text);
             if (!(data.text || '').trim()) {
                 setStatus('未提取到文本；文件已关联，可输入问题后发送（仅发送您输入的内容）');
             } else {
@@ -1319,11 +1340,12 @@ async def chat_ui() -> str:
             const f = e.target.files && e.target.files[0];
             e.target.value = '';
             if (!f) return;
+            var item = enqueuePendingFile(f, '识别中…');
             try {
-                await postOcrImage(f);
+                await postOcrImage(f, item);
             } catch (err) {
                 console.error(err);
-                setStatus('识别失败：' + (err.message || err));
+                failPendingFile(item, '识别失败：' + (err.message || err));
             }
         });
         if (fileImage) fileImage.addEventListener('change', async function (e) {
@@ -1332,12 +1354,13 @@ async def chat_ui() -> str:
             if (!files.length) return;
             var ok = 0;
             for (var i = 0; i < files.length; i++) {
+                var item = enqueuePendingFile(files[i], '识别中…');
                 try {
-                    await postOcrImage(files[i]);
+                    await postOcrImage(files[i], item);
                     ok++;
                 } catch (err) {
                     console.error(err);
-                    setStatus('第 ' + (i + 1) + ' 张识别失败：' + (err.message || err));
+                    failPendingFile(item, '第 ' + (i + 1) + ' 张识别失败：' + (err.message || err));
                 }
             }
             if (ok > 0) setStatus('已导入 ' + ok + ' 张图片');
@@ -1348,12 +1371,13 @@ async def chat_ui() -> str:
             if (!files.length) return;
             var ok = 0;
             for (var i = 0; i < files.length; i++) {
+                var item = enqueuePendingFile(files[i], '解析中…');
                 try {
-                    await postUploadFile(files[i]);
+                    await postUploadFile(files[i], item);
                     ok++;
                 } catch (err) {
                     console.error(err);
-                    setStatus('第 ' + (i + 1) + ' 个文件上传失败：' + (err.message || err));
+                    failPendingFile(item, '第 ' + (i + 1) + ' 个文件上传失败：' + (err.message || err));
                 }
             }
             if (ok > 0) setStatus('已导入 ' + ok + ' 个文件');
