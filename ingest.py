@@ -6,8 +6,6 @@ from typing import List, Tuple
 
 import dashscope
 import numpy as np
-import pytesseract
-from PIL import Image
 from PyPDF2 import PdfReader
 from dashscope import TextEmbedding
 from docx import Document
@@ -37,14 +35,10 @@ def read_docx(path: Path) -> str:
 
 
 def read_image_with_ocr(path: Path) -> str:
-    """通过 OCR 提取图片中的文字。
+    """通过阿里云百炼 Qwen-OCR 提取图片中的文字。"""
+    from document_extract import ocr_image_bytes
 
-    说明：
-    - 比赛中用于展示多模态能力，将图片内容转为文本后统一进入向量索引。
-    """
-    image = Image.open(str(path))
-    text = pytesseract.image_to_string(image, lang="chi_sim+eng")
-    return text
+    return ocr_image_bytes(path.read_bytes(), path.name)
 
 
 def split_text(text: str, chunk_size: int, overlap: int) -> List[str]:

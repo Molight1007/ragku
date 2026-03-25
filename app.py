@@ -1,13 +1,22 @@
 from __future__ import annotations
 
+import uuid
+from pathlib import Path
 from typing import List
 
-from fastapi import FastAPI
+from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.responses import HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 from rag_service import rag_answer
+
+MAX_UPLOAD_BYTES = 15 * 1024 * 1024
+UPLOAD_DIR = Path(__file__).resolve().parent / "uploads"
+
+
+def _ensure_upload_dir() -> None:
+    UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
 
 class ChatRequest(BaseModel):
@@ -31,16 +40,32 @@ class ChatResponse(BaseModel):
     contexts: List[ContextSnippet]
 
 
+class OCRImageResponse(BaseModel):
+    """图片 OCR 接口返回。"""
+
+    text: str
+    filename: str
+
+
+class UploadExtractResponse(BaseModel):
+    """文件上传并解析文本后的返回。"""
+
+    text: str
+    filename: str
+    saved_path: str
+
+
 app = FastAPI(
     title="本地知识库RAG问答系统",
     description="基于阿里云通义千问 + 本地多模态知识库的RAG服务，用于大赛展示。",
     version="1.0.0",
 )
 
+# 注意：allow_credentials=True 时不能使用 allow_origins=["*"]，否则浏览器会拦截跨域请求。
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -53,6 +78,73 @@ async def index() -> dict:
         "message": "本地知识库RAG问答系统已启动。",
         "docs": "/docs",
     }
+
+
+@app.post("/api/ocr/image", response_model=OCRImageResponse)
+async def api_ocr_image(file: UploadFile = File(...)) -> OCRImageResponse:
+    """上传图片，返回百炼 Qwen-OCR 识别的文字。"""
+    from config import settings as app_settings
+    from document_extract import is_image_filename, ocr_image_bytes
+
+    if not app_settings.dashscope_api_key:
+        raise HTTPException(status_code=400, detail="未配置 DASHSCOPE_API_KEY，无法调用百炼图片识别")
+    if not file.filename:
+        raise HTTPException(status_code=400, detail="缺少文件名")
+    if not is_image_filename(file.filename):
+        raise HTTPException(
+            status_code=400,
+            detail="请上传图片文件（jpg / png / bmp / webp / gif）",
+        )
+    data = await file.read()
+    if len(data) > MAX_UPLOAD_BYTES:
+        raise HTTPException(status_code=413, detail="图片过大，请压缩后重试")
+    try:
+        text = ocr_image_bytes(data, file.filename)
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=422, detail=f"图片识别失败: {e}") from e
+    return OCRImageResponse(text=text.strip(), filename=file.filename)
+
+
+@app.post("/api/upload/file", response_model=UploadExtractResponse)
+async def api_upload_file(file: UploadFile = File(...)) -> UploadExtractResponse:
+    """上传文件：保存到本地 uploads/，并尽量提取文本（与知识库支持的类型一致）。"""
+    from config import settings as app_settings
+    from document_extract import (
+        extract_text_from_bytes,
+        is_allowed_upload,
+        is_image_filename,
+        safe_upload_name,
+    )
+
+    if not file.filename:
+        raise HTTPException(status_code=400, detail="缺少文件名")
+    if not is_allowed_upload(file.filename):
+        raise HTTPException(
+            status_code=400,
+            detail="仅支持 txt、md、pdf、docx 及常见图片格式",
+        )
+    data = await file.read()
+    if len(data) > MAX_UPLOAD_BYTES:
+        raise HTTPException(status_code=413, detail="文件过大")
+    if is_image_filename(file.filename) and not app_settings.dashscope_api_key:
+        raise HTTPException(status_code=400, detail="未配置 DASHSCOPE_API_KEY，无法对图片调用百炼识别")
+    try:
+        text = extract_text_from_bytes(file.filename, data)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=422, detail=f"解析文件失败: {e}") from e
+
+    _ensure_upload_dir()
+    stored = f"{uuid.uuid4().hex[:12]}_{safe_upload_name(file.filename)}"
+    dest = UPLOAD_DIR / stored
+    dest.write_bytes(data)
+    rel = str(dest.relative_to(Path(__file__).resolve().parent)).replace("\\", "/")
+    return UploadExtractResponse(
+        text=(text or "").strip(),
+        filename=file.filename,
+        saved_path=rel,
+    )
 
 
 @app.get("/chat-ui", response_class=HTMLResponse)
@@ -107,6 +199,7 @@ async def chat_ui() -> str:
         }
         .chat-box {
             flex: 1;
+            min-height: 0;
             display: block;
             overflow-y: auto;
             padding: 0;
@@ -185,6 +278,9 @@ async def chat_ui() -> str:
         }
         .composer-wrap {
             margin-top: 12px;
+            flex-shrink: 0;
+            position: relative;
+            z-index: 20;
         }
         .composer {
             display: flex;
@@ -195,9 +291,13 @@ async def chat_ui() -> str:
             border-radius: 28px;
             box-shadow: 0 10px 24px rgba(50, 59, 81, 0.08), 0 2px 6px rgba(50, 59, 81, 0.05);
             padding: 8px 14px;
+            position: relative;
+            z-index: 21;
+            overflow: visible;
         }
         .question-input {
             flex: 1;
+            min-width: 0;
             width: 100%;
             border: none;
             outline: none;
@@ -223,11 +323,15 @@ async def chat_ui() -> str:
             justify-content: flex-end;
             gap: 8px;
             position: relative;
+            flex-shrink: 0;
+            z-index: 22;
         }
         .plus-wrap {
             position: relative;
             display: inline-flex;
             align-items: center;
+            flex-shrink: 0;
+            z-index: 30;
         }
         .plus-btn {
             width: 40px;
@@ -247,7 +351,8 @@ async def chat_ui() -> str:
         .plus-menu {
             position: absolute;
             right: 0;
-            bottom: calc(100% + 10px);
+            top: auto;
+            bottom: calc(100% + 8px);
             min-width: 210px;
             background: #ffffff;
             border: 1px solid #e5e7ee;
@@ -255,7 +360,7 @@ async def chat_ui() -> str:
             box-shadow: 0 14px 24px rgba(33, 43, 60, 0.12);
             overflow: hidden;
             display: none;
-            z-index: 20;
+            z-index: 200;
         }
         .plus-menu.show {
             display: block;
@@ -298,6 +403,8 @@ async def chat_ui() -> str:
             font-weight: 700;
             cursor: pointer;
             flex-shrink: 0;
+            position: relative;
+            z-index: 22;
             box-shadow: 0 4px 10px rgba(71, 111, 216, 0.35);
             display: inline-flex;
             align-items: center;
@@ -350,17 +457,20 @@ async def chat_ui() -> str:
                     <div class="plus-wrap">
                         <button id="plusBtn" class="plus-btn" type="button" aria-label="更多功能">+</button>
                         <div id="plusMenu" class="plus-menu">
-                            <button class="plus-item" type="button"><span class="plus-icon">📷</span>拍照识文字</button>
-                            <button class="plus-item" type="button"><span class="plus-icon">🖼</span>图片识文字</button>
-                            <button class="plus-item" type="button"><span class="plus-icon">📎</span>文件</button>
+                            <button class="plus-item" id="plusBtnCamera" type="button"><span class="plus-icon">📷</span>拍照识文字</button>
+                            <button class="plus-item" id="plusBtnImage" type="button"><span class="plus-icon">🖼</span>图片识文字</button>
+                            <button class="plus-item" id="plusBtnFile" type="button"><span class="plus-icon">📎</span>文件</button>
                         </div>
                     </div>
-                    <button id="sendBtn" class="send-btn" onclick="sendQuestion()">↑</button>
+                    <button id="sendBtn" class="send-btn" type="button">↑</button>
                 </div>
             </div>
             <div class="status" id="statusText">就绪</div>
         </div>
     </div>
+    <input type="file" id="fileCamera" accept="image/*" capture="environment" style="display:none" />
+    <input type="file" id="fileImage" accept="image/*" style="display:none" />
+    <input type="file" id="fileDoc" accept=".txt,.md,.pdf,.docx,.jpg,.jpeg,.png,.bmp,.webp,.gif" style="display:none" />
     <script>
         const chatBox = document.getElementById('chatBox');
         const questionInput = document.getElementById('questionInput');
@@ -369,12 +479,33 @@ async def chat_ui() -> str:
         const welcomeText = document.getElementById('welcomeText');
         const plusBtn = document.getElementById('plusBtn');
         const plusMenu = document.getElementById('plusMenu');
+        const plusBtnCamera = document.getElementById('plusBtnCamera');
+        const plusBtnImage = document.getElementById('plusBtnImage');
+        const plusBtnFile = document.getElementById('plusBtnFile');
+        const fileCamera = document.getElementById('fileCamera');
+        const fileImage = document.getElementById('fileImage');
+        const fileDoc = document.getElementById('fileDoc');
+
+        function apiUrl(path) {
+            var base = (window.location.origin && window.location.origin !== 'null')
+                ? window.location.origin
+                : 'http://127.0.0.1:8000';
+            return new URL(path, base).href;
+        }
+
+        function explainFetchError(err) {
+            if (err && err.name === 'TypeError') {
+                return '无法连接服务器。请用地址栏打开 ' + window.location.origin + '/chat-ui（不要用本地离线网页），并确认本机已启动 uvicorn。';
+            }
+            return (err && err.message) ? err.message : String(err);
+        }
 
         function setStatus(text) {
-            statusText.textContent = text;
+            if (statusText) statusText.textContent = text;
         }
 
         function setSendBtnBusy(busy) {
+            if (!sendBtn) return;
             sendBtn.disabled = busy;
             sendBtn.setAttribute('aria-busy', busy ? 'true' : 'false');
             if (busy) {
@@ -385,16 +516,77 @@ async def chat_ui() -> str:
         }
 
         function autoResizeInput() {
+            if (!questionInput) return;
             questionInput.style.height = 'auto';
             questionInput.style.height = Math.min(questionInput.scrollHeight, 220) + 'px';
         }
 
         function hidePlusMenu() {
-            plusMenu.classList.remove('show');
+            if (plusMenu) plusMenu.classList.remove('show');
+        }
+
+        function mergeIntoInput(text, hintEmpty) {
+            if (!questionInput) return;
+            const t = (text || '').trim();
+            if (!t) {
+                setStatus(hintEmpty || '未识别到文字');
+                return;
+            }
+            const cur = questionInput.value.trim();
+            questionInput.value = cur ? (cur + '\\n\\n' + t) : t;
+            autoResizeInput();
+        }
+
+        async function postOcrImage(file) {
+            setStatus('识别图片中…');
+            const fd = new FormData();
+            fd.append('file', file, file.name);
+            let resp;
+            try {
+                resp = await fetch(apiUrl('/api/ocr/image'), { method: 'POST', body: fd });
+            } catch (err) {
+                throw new Error(explainFetchError(err));
+            }
+            let data = null;
+            try {
+                data = await resp.json();
+            } catch (e) {
+                data = null;
+            }
+            if (!resp.ok) {
+                const msg = (data && data.detail) ? (Array.isArray(data.detail) ? data.detail[0].msg : data.detail) : ('HTTP ' + resp.status);
+                throw new Error(msg);
+            }
+            mergeIntoInput(data.text, '未识别到文字');
+            setStatus('图片识别完成');
+        }
+
+        async function postUploadFile(file) {
+            setStatus('上传并解析文件…');
+            const fd = new FormData();
+            fd.append('file', file, file.name);
+            let resp;
+            try {
+                resp = await fetch(apiUrl('/api/upload/file'), { method: 'POST', body: fd });
+            } catch (err) {
+                throw new Error(explainFetchError(err));
+            }
+            let data = null;
+            try {
+                data = await resp.json();
+            } catch (e) {
+                data = null;
+            }
+            if (!resp.ok) {
+                const msg = (data && data.detail) ? (Array.isArray(data.detail) ? data.detail[0].msg : data.detail) : ('HTTP ' + resp.status);
+                throw new Error(msg);
+            }
+            mergeIntoInput(data.text, '文件中未提取到文本');
+            setStatus('已保存：' + (data.saved_path || '') + '（内容已填入输入框）');
         }
 
         function setChatBoxActive(active) {
-            chatBox.classList.toggle('active', active);
+            if (chatBox) chatBox.classList.toggle('active', active);
         }
 
         function createAvatar(role) {
@@ -437,23 +629,33 @@ async def chat_ui() -> str:
                 wrap.appendChild(contentWrap);
             }
 
-            chatBox.appendChild(wrap);
-            chatBox.scrollTop = chatBox.scrollHeight;
+            if (chatBox) {
+                chatBox.appendChild(wrap);
+                chatBox.scrollTop = chatBox.scrollHeight;
+            }
         }
 
         function resetChat() {
-            chatBox.innerHTML = '';
+            if (chatBox) chatBox.innerHTML = '';
             setChatBoxActive(false);
             hidePlusMenu();
-            welcomeText.style.display = 'block';
+            if (welcomeText) welcomeText.style.display = 'block';
             setStatus('就绪');
         }
 
         async function sendQuestion() {
+            if (!questionInput) {
+                setStatus('页面未就绪，请刷新重试');
+                return;
+            }
             const q = questionInput.value.trim();
-            if (!q) return;
+            if (!q) {
+                setStatus('请输入问题后再发送');
+                try { questionInput.focus(); } catch (e) {}
+                return;
+            }
 
-            welcomeText.style.display = 'none';
+            if (welcomeText) welcomeText.style.display = 'none';
             appendMessage('user', q);
             questionInput.value = '';
             autoResizeInput();
@@ -461,11 +663,16 @@ async def chat_ui() -> str:
             setStatus('检索中');
 
             try {
-                const resp = await fetch('/chat', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ question: q })
-                });
+                let resp;
+                try {
+                    resp = await fetch(apiUrl('/chat'), {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ question: q })
+                    });
+                } catch (err) {
+                    throw new Error(explainFetchError(err));
+                }
                 if (!resp.ok) {
                     throw new Error('请求失败，状态码：' + resp.status);
                 }
@@ -484,24 +691,92 @@ async def chat_ui() -> str:
             }
         }
 
-        questionInput.addEventListener('keydown', function (e) {
-            if (e.key === 'Enter' && !e.shiftKey) {
+        if (sendBtn) {
+            sendBtn.addEventListener('click', function (e) {
                 e.preventDefault();
+                e.stopPropagation();
                 sendQuestion();
-            }
-        });
-        questionInput.addEventListener('input', autoResizeInput);
-        plusBtn.addEventListener('click', function (e) {
-            e.stopPropagation();
-            plusMenu.classList.toggle('show');
-        });
+            });
+        }
+        if (questionInput) {
+            questionInput.addEventListener('keydown', function (e) {
+                if (e.key === 'Enter' && !e.shiftKey) {
+                    e.preventDefault();
+                    sendQuestion();
+                }
+            });
+            questionInput.addEventListener('input', autoResizeInput);
+        }
+        if (plusBtn && plusMenu) {
+            plusBtn.addEventListener('click', function (e) {
+                e.stopPropagation();
+                plusMenu.classList.toggle('show');
+            });
+        }
         document.addEventListener('click', function (e) {
-            if (!plusMenu.contains(e.target) && e.target !== plusBtn) {
+            if (!plusMenu || !plusBtn) return;
+            var t = e.target;
+            if (plusMenu.contains(t) || t === plusBtn || plusBtn.contains(t)) return;
+            hidePlusMenu();
+        });
+
+        if (plusBtnCamera && fileCamera) {
+            plusBtnCamera.addEventListener('click', function (e) {
+                e.preventDefault();
+                e.stopPropagation();
                 hidePlusMenu();
+                fileCamera.click();
+            });
+        }
+        if (plusBtnImage && fileImage) {
+            plusBtnImage.addEventListener('click', function (e) {
+                e.preventDefault();
+                e.stopPropagation();
+                hidePlusMenu();
+                fileImage.click();
+            });
+        }
+        if (plusBtnFile && fileDoc) {
+            plusBtnFile.addEventListener('click', function (e) {
+                e.preventDefault();
+                e.stopPropagation();
+                hidePlusMenu();
+                fileDoc.click();
+            });
+        }
+
+        if (fileCamera) fileCamera.addEventListener('change', async function (e) {
+            const f = e.target.files && e.target.files[0];
+            e.target.value = '';
+            if (!f) return;
+            try {
+                await postOcrImage(f);
+            } catch (err) {
+                console.error(err);
+                setStatus('识别失败：' + (err.message || err));
             }
         });
-        plusMenu.addEventListener('click', function () {
-            hidePlusMenu();
+        if (fileImage) fileImage.addEventListener('change', async function (e) {
+            const f = e.target.files && e.target.files[0];
+            e.target.value = '';
+            if (!f) return;
+            try {
+                await postOcrImage(f);
+            } catch (err) {
+                console.error(err);
+                setStatus('识别失败：' + (err.message || err));
+            }
+        });
+        if (fileDoc) fileDoc.addEventListener('change', async function (e) {
+            const f = e.target.files && e.target.files[0];
+            e.target.value = '';
+            if (!f) return;
+            try {
+                await postUploadFile(f);
+            } catch (err) {
+                console.error(err);
+                setStatus('上传失败：' + (err.message || err));
+            }
         });
 
         resetChat();

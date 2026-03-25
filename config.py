@@ -16,6 +16,15 @@ class Settings:
     # 阿里云通义千问密钥（请在环境变量或 .env 中设置）
     dashscope_api_key: str = os.getenv("DASHSCOPE_API_KEY", "")
 
+    # 百炼 OpenAI 兼容接口 Base URL（国内一般为北京；新加坡/国际见阿里云文档）
+    dashscope_compatible_base_url: str = os.getenv(
+        "DASHSCOPE_BASE_URL",
+        "https://dashscope.aliyuncs.com/compatible-mode/v1",
+    )
+
+    # 百炼图片识别（Qwen-OCR）模型名，可与控制台对照后通过环境变量覆盖
+    ocr_model: str = os.getenv("DASHSCOPE_OCR_MODEL", "qwen-vl-ocr-latest")
+
     # 使用的通义千问对话模型名称
     llm_model: str = "qwen-turbo"
 
