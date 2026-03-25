@@ -233,7 +233,10 @@ class LauncherApp:
         self.root.minsize(720, 480)
 
         self.status_var = StringVar(value="就绪")
-        self.server_proc: subprocess.Popen | None = None
+        # 软件版启动器在 PyInstaller(onefile) 下不适合用 subprocess 再去找 uvicorn，
+        # 因为子进程环境里可能找不到 uvicorn 模块。这里直接在当前进程内启动 uvicorn。
+        self.server_thread: threading.Thread | None = None
+        self.uvicorn_server: object | None = None
         self.data_dir: Path = _default_data_dir()
 
         self._build_ui()
@@ -296,7 +299,7 @@ class LauncherApp:
     def _refresh_status(self) -> None:
         key_ok = bool(_read_env_key())
         idx_ok = INDEX_STORE.exists() and INDEX_META.exists()
-        srv_ok = self.server_proc is not None and self.server_proc.poll() is None
+        srv_ok = self.server_thread is not None and self.server_thread.is_alive()
         self.status_var.set(
             " | ".join(
                 [
@@ -368,7 +371,7 @@ class LauncherApp:
         threading.Thread(target=worker, daemon=True).start()
 
     def action_start_server(self) -> None:
-        if self.server_proc is not None and self.server_proc.poll() is None:
+        if self.server_thread is not None and self.server_thread.is_alive():
             self.log("服务已在运行")
             return
         if not _read_env_key():
@@ -384,84 +387,77 @@ class LauncherApp:
             return
         _apply_env_key()
         os.chdir(str(APP_DIR))
-        self.log("启动 uvicorn（子进程）……")
-        env = os.environ.copy()
         try:
-            kw: dict[str, object] = {
-                "cwd": str(APP_DIR),
-                "env": env,
-                "stdout": subprocess.PIPE,
-                "stderr": subprocess.STDOUT,
-                "text": True,
-                "bufsize": 1,
-            }
-            if sys.platform == "win32":
-                kw["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-            self.server_proc = subprocess.Popen(
-                [
-                    sys.executable,
-                    "-m",
-                    "uvicorn",
-                    "app:app",
-                    "--host",
-                    "0.0.0.0",
-                    "--port",
-                    str(SERVER_PORT),
-                ],
-                **kw,
+            import uvicorn
+
+            # 从当前工作目录加载 app:app，避免 frozen 环境下相对路径问题
+            from app import app as fastapi_app
+
+            self.log("启动 uvicorn（线程内运行）……")
+            config = uvicorn.Config(
+                fastapi_app,
+                host="0.0.0.0",
+                port=SERVER_PORT,
+                log_level="info",
+                # PyInstaller(frozen) + 线程启动时，uvicorn 默认 dictConfig
+                # 可能触发 “Unable to configure formatter 'default'”。
+                # 这里禁用 uvicorn 自带日志配置，避免启动失败。
+                log_config=None,
+                reload=False,
             )
+            self.uvicorn_server = uvicorn.Server(config)
+            self.server_thread = threading.Thread(target=self.uvicorn_server.run, daemon=True)
+            self.server_thread.start()
         except Exception as e:  # noqa: BLE001
+            import traceback
+
             self.log(f"启动失败：{e}")
-            self.server_proc = None
+            self.log(traceback.format_exc())
+            self.server_thread = None
+            self.uvicorn_server = None
             return
 
-        def read_stdout() -> None:
-            proc = self.server_proc
-            if proc is None or proc.stdout is None:
-                return
-            for line in iter(proc.stdout.readline, ""):
-                if not line:
+        def wait_and_open() -> None:
+            # 给 uvicorn 一点启动时间，再打开浏览器
+            start_ok = False
+            t0 = time.time()
+            while time.time() - t0 < 10.0:
+                if _port_in_use(SERVER_PORT):
+                    start_ok = True
                     break
-                self.log(line.rstrip("\r\n"))
-            with contextlib.suppress(Exception):
-                proc.stdout.close()
+                time.sleep(0.2)
+            if start_ok:
+                self.root.after(0, self.action_open_chat)
+            else:
+                self.log("端口未在规定时间内就绪，可能启动失败或端口被占用。")
 
-        threading.Thread(target=read_stdout, daemon=True).start()
-
-        def check_fast_fail() -> None:
-            p = self.server_proc
-            if p is None:
-                return
-            if p.poll() is not None:
-                self.log(f"服务未能保持运行，退出码 {p.returncode}。请查看上方日志。")
-                self.server_proc = None
-
-        self.root.after(1500, check_fast_fail)
-        self.root.after(800, self.action_open_chat)
+        threading.Thread(target=wait_and_open, daemon=True).start()
 
     def action_open_chat(self) -> None:
         webbrowser.open(CHAT_URL)
         self.log(f"已打开 {CHAT_URL}")
 
     def action_stop_server(self) -> None:
-        if self.server_proc is None or self.server_proc.poll() is not None:
+        if self.uvicorn_server is None:
             self.log("服务未运行")
-            self.server_proc = None
+            self.server_thread = None
             return
         self.log("正在停止……")
         try:
-            self.server_proc.terminate()
-            self.server_proc.wait(timeout=8)
-        except subprocess.TimeoutExpired:
-            self.server_proc.kill()
+            # uvicorn.Server 会通过 should_exit 优雅退出
+            # 类型在此处宽松处理，避免 PyInstaller 类型推断问题
+            setattr(self.uvicorn_server, "should_exit", True)
+            if self.server_thread is not None:
+                self.server_thread.join(timeout=8)
         except Exception as e:  # noqa: BLE001
             self.log(f"停止异常：{e}")
         finally:
-            self.server_proc = None
+            self.uvicorn_server = None
+            self.server_thread = None
             self.log("已停止")
 
     def on_close(self) -> None:
-        if self.server_proc is not None and self.server_proc.poll() is None:
+        if self.uvicorn_server is not None:
             if not messagebox.askyesno("退出", "服务仍在运行，是否停止并退出？"):
                 return
             self.action_stop_server()

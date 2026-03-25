@@ -1,13 +1,10 @@
 from __future__ import annotations
 
 import os
-import socket
-import subprocess
 import sys
 import threading
 import time
 import webbrowser
-from pathlib import Path
 from tkinter import DISABLED, END, NORMAL, Button, Label, StringVar, Text, Tk, messagebox
 
 from launcher import APP_DIR, CHAT_URL, INDEX_META, INDEX_STORE, SERVER_PORT
@@ -32,7 +29,9 @@ class QuickLauncherApp:
         self.root.minsize(480, 300)
 
         self.status_var = StringVar(value="准备启动……")
-        self.server_proc: subprocess.Popen | None = None
+        # 避免子进程找不到 uvicorn（PyInstaller frozen 环境常见问题）
+        self.server_thread: threading.Thread | None = None
+        self.uvicorn_server: object | None = None
 
         top = Label(self.root, text="一键启动本地 RAG 服务", font=("Microsoft YaHei UI", 14, "bold"))
         top.pack(anchor="w", padx=14, pady=(12, 6))
@@ -82,7 +81,7 @@ class QuickLauncherApp:
             messagebox.showwarning("提示", "未找到索引文件。\n请先双击运行：02_重建索引.cmd")
             self.status_var.set("索引未构建")
             return
-        if self.server_proc is not None and self.server_proc.poll() is None:
+        if self.server_thread is not None and self.server_thread.is_alive():
             self.log("服务已在运行")
             return
         if _port_in_use(SERVER_PORT):
@@ -93,66 +92,49 @@ class QuickLauncherApp:
 
         _apply_env_key()
         os.chdir(str(APP_DIR))
-        self.log("启动 uvicorn（子进程）……")
+        try:
+            import uvicorn
 
-        env = os.environ.copy()
-        kw: dict[str, object] = {
-            "cwd": str(APP_DIR),
-            "env": env,
-            "stdout": subprocess.PIPE,
-            "stderr": subprocess.STDOUT,
-            "text": True,
-            "bufsize": 1,
-        }
-        if sys.platform == "win32":
-            kw["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+            from app import app as fastapi_app
 
-        self.server_proc = subprocess.Popen(
-            [
-                sys.executable,
-                "-m",
-                "uvicorn",
-                "app:app",
-                "--host",
-                "0.0.0.0",
-                "--port",
-                str(SERVER_PORT),
-            ],
-            **kw,
-        )
+            self.log("启动 uvicorn（线程内运行）……")
+            config = uvicorn.Config(
+                fastapi_app,
+                host="0.0.0.0",
+                port=SERVER_PORT,
+                log_level="info",
+                # 同 launcher：禁用 uvicorn 默认日志 dictConfig，避免 frozen 环境报错
+                log_config=None,
+                reload=False,
+            )
+            self.uvicorn_server = uvicorn.Server(config)
+            self.server_thread = threading.Thread(target=self.uvicorn_server.run, daemon=True)
+            self.server_thread.start()
+        except Exception as e:  # noqa: BLE001
+            import traceback
 
-        def read_stdout() -> None:
-            proc = self.server_proc
-            if proc is None or proc.stdout is None:
-                return
-            for line in iter(proc.stdout.readline, ""):
-                if not line:
-                    break
-                self.log(line.rstrip("\r\n"))
-            try:
-                proc.stdout.close()
-            except Exception:
-                pass
-
-        threading.Thread(target=read_stdout, daemon=True).start()
+            self.log(f"启动失败：{e}")
+            self.log(traceback.format_exc())
+            self.uvicorn_server = None
+            self.server_thread = None
 
     def action_stop_server(self) -> None:
-        if self.server_proc is None or self.server_proc.poll() is not None:
+        if self.uvicorn_server is None:
             self.log("服务未运行")
             self.status_var.set("服务未运行")
-            self.server_proc = None
+            self.server_thread = None
             return
 
         self.log("正在停止……")
         try:
-            self.server_proc.terminate()
-            self.server_proc.wait(timeout=8)
-        except subprocess.TimeoutExpired:
-            self.server_proc.kill()
+            setattr(self.uvicorn_server, "should_exit", True)
+            if self.server_thread is not None:
+                self.server_thread.join(timeout=8)
         except Exception as e:  # noqa: BLE001
             self.log(f"停止异常：{e}")
         finally:
-            self.server_proc = None
+            self.uvicorn_server = None
+            self.server_thread = None
             self.status_var.set("已停止")
             self.log("已停止")
 
@@ -175,7 +157,7 @@ class QuickLauncherApp:
         self.root.after(1000, self._refresh_status)
 
     def _refresh_status(self) -> None:
-        srv_ok = self.server_proc is not None and self.server_proc.poll() is None
+        srv_ok = self.server_thread is not None and self.server_thread.is_alive()
         if srv_ok:
             self.status_var.set("运行中")
         else:
