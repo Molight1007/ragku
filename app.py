@@ -292,17 +292,29 @@ async def chat_ui() -> str:
             height: 40px;
             border: none;
             border-radius: 999px;
-            background: #bfd0f8;
+            background: #4a6fd4;
             color: #fff;
             font-size: 18px;
             font-weight: 700;
             cursor: pointer;
             flex-shrink: 0;
-            box-shadow: 0 4px 10px rgba(106, 138, 220, 0.28);
+            box-shadow: 0 4px 10px rgba(71, 111, 216, 0.35);
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
         }
         .send-btn:disabled {
-            background: #cad8fb;
+            background: #bfd0f8;
+            color: #bfd0f8;
             cursor: not-allowed;
+            box-shadow: 0 4px 10px rgba(106, 138, 220, 0.28);
+        }
+        .send-square {
+            display: block;
+            width: 12px;
+            height: 12px;
+            border-radius: 2px;
+            background: #355ddf;
         }
         .status {
             margin-top: 8px;
@@ -360,6 +372,16 @@ async def chat_ui() -> str:
 
         function setStatus(text) {
             statusText.textContent = text;
+        }
+
+        function setSendBtnBusy(busy) {
+            sendBtn.disabled = busy;
+            sendBtn.setAttribute('aria-busy', busy ? 'true' : 'false');
+            if (busy) {
+                sendBtn.innerHTML = '<span class="send-square" aria-hidden="true"></span>';
+            } else {
+                sendBtn.textContent = '↑';
+            }
         }
 
         function autoResizeInput() {
@@ -435,7 +457,7 @@ async def chat_ui() -> str:
             appendMessage('user', q);
             questionInput.value = '';
             autoResizeInput();
-            sendBtn.disabled = true;
+            setSendBtnBusy(true);
             setStatus('检索中');
 
             try {
@@ -457,7 +479,7 @@ async def chat_ui() -> str:
                 setChatBoxActive(true);
                 setStatus('异常');
             } finally {
-                sendBtn.disabled = false;
+                setSendBtnBusy(false);
                 setTimeout(() => setStatus('就绪'), 800);
             }
         }
