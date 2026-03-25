@@ -1,3 +1,21 @@
 __pycache__/
 *.py[cod]
 
+# 本机密钥：不要提交到仓库
+.env
+
+# 打包/构建产物：不建议提交
+/build/
+/dist/
+*.exe
+
+# 运行时上传/生成的文件：不建议提交
+/uploads/
+
+# 本地虚拟环境
+/.venv/
+
+# 索引文件：由知识库生成，可由脚本重建
+/index_store.npy
+/index_meta.npy
+

@@ -54,15 +54,28 @@ if errorlevel 1 (
 )
 
 echo.
-echo 正在把 .env（若存在）复制到 dist\ 目录...
+echo 正在把运行所需文件复制到 dist\ 目录...
 if exist "dist\" (
-  if exist ".env" (
-    copy /Y ".env" "dist\.env" >nul
-  )
+  if exist ".env" copy /Y ".env" "dist\.env" >nul
+  if exist "index_store.npy" copy /Y "index_store.npy" "dist\index_store.npy" >nul
+  if exist "index_meta.npy" copy /Y "index_meta.npy" "dist\index_meta.npy" >nul
 )
 
 echo.
-echo 打包完成后，请到 dist\RAG启动器.exe 运行。
+echo 正在打包“一键启动器”……
+.venv\Scripts\python -m PyInstaller --noconfirm --clean --name "RAG一键启动器" --onefile --windowed quick_launcher.py
+if errorlevel 1 (
+  echo.
+  echo 打包失败，请滚动查看上方报错信息。
+  echo.
+  pause
+  exit /b 1
+)
+
+echo.
+echo 打包完成后，请到 dist\ 目录运行：
+echo - dist\RAG启动器.exe（带按钮的完整启动器）
+echo - dist\RAG一键启动器.exe（一键启动 + 停止按钮）
 echo.
 pause
 
