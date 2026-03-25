@@ -486,12 +486,17 @@ async def chat_ui() -> str:
             cursor: not-allowed;
             box-shadow: 0 4px 10px rgba(106, 138, 220, 0.28);
         }
+        .send-btn[aria-busy="true"] {
+            background: #3d5eb8;
+            cursor: pointer;
+            box-shadow: 0 4px 10px rgba(61, 94, 184, 0.45);
+        }
         .send-square {
             display: block;
             width: 12px;
             height: 12px;
             border-radius: 2px;
-            background: #355ddf;
+            background: #fff;
         }
         .status {
             margin-top: 8px;
@@ -535,7 +540,7 @@ async def chat_ui() -> str:
                             <button class="plus-item" id="plusBtnFile" type="button"><span class="plus-icon">📎</span>文件</button>
                         </div>
                     </div>
-                    <button id="sendBtn" class="send-btn" type="button">↑</button>
+                    <button id="sendBtn" class="send-btn" type="button" aria-label="发送">↑</button>
                 </div>
             </div>
             <div class="status" id="statusText">就绪</div>
@@ -561,6 +566,9 @@ async def chat_ui() -> str:
         const attachmentStrip = document.getElementById('attachmentStrip');
 
         let pendingAttachment = null;
+        let chatInFlight = false;
+        let chatAbortController = null;
+        let chatCancelReason = null;
 
         function apiUrl(path) {
             var base = (window.location.origin && window.location.origin !== 'null')
@@ -582,12 +590,16 @@ async def chat_ui() -> str:
 
         function setSendBtnBusy(busy) {
             if (!sendBtn) return;
-            sendBtn.disabled = busy;
+            sendBtn.disabled = false;
             sendBtn.setAttribute('aria-busy', busy ? 'true' : 'false');
             if (busy) {
                 sendBtn.innerHTML = '<span class="send-square" aria-hidden="true"></span>';
+                sendBtn.setAttribute('aria-label', '停止本次回答');
+                sendBtn.title = '点击停止本次回答';
             } else {
                 sendBtn.textContent = '↑';
+                sendBtn.setAttribute('aria-label', '发送');
+                sendBtn.title = '';
             }
         }
 
@@ -773,6 +785,15 @@ async def chat_ui() -> str:
         }
 
         function resetChat() {
+            if (chatInFlight && chatAbortController) {
+                chatCancelReason = 'reset';
+                try { chatAbortController.abort(); } catch (e) {}
+            } else {
+                chatCancelReason = null;
+            }
+            chatInFlight = false;
+            chatAbortController = null;
+            setSendBtnBusy(false);
             if (chatBox) chatBox.innerHTML = '';
             setChatBoxActive(false);
             hidePlusMenu();
@@ -784,6 +805,10 @@ async def chat_ui() -> str:
         async function sendQuestion() {
             if (!questionInput) {
                 setStatus('页面未就绪，请刷新重试');
+                return;
+            }
+            if (chatInFlight) {
+                setStatus('回答生成中，可点击蓝色按钮停止');
                 return;
             }
             const q = questionInput.value.trim();
@@ -804,6 +829,9 @@ async def chat_ui() -> str:
             appendMessage('user', userShow);
             questionInput.value = '';
             autoResizeInput();
+
+            chatAbortController = new AbortController();
+            chatInFlight = true;
             setSendBtnBusy(true);
             setStatus('检索中');
 
@@ -813,9 +841,13 @@ async def chat_ui() -> str:
                     resp = await fetch(apiUrl('/chat'), {
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json' },
+                        signal: chatAbortController.signal,
                         body: JSON.stringify({ question: q, attachment_text: pendingAttachment ? (pendingAttachment.text || '') : '' })
                     });
                 } catch (err) {
+                    if (err && err.name === 'AbortError') {
+                        throw err;
+                    }
                     throw new Error(explainFetchError(err));
                 }
                 if (!resp.ok) {
@@ -827,13 +859,25 @@ async def chat_ui() -> str:
                 setStatus('完成');
                 clearPendingAttachment();
             } catch (err) {
-                console.error(err);
-                appendMessage('bot', '请求后端失败，请检查服务是否在运行，或稍后再试。', []);
-                setChatBoxActive(true);
-                setStatus('异常');
+                if (err && err.name === 'AbortError') {
+                    const reason = chatCancelReason;
+                    chatCancelReason = null;
+                    if (reason === 'user') {
+                        appendMessage('bot', '已停止本次回答。', []);
+                        setChatBoxActive(true);
+                        setStatus('已停止');
+                    }
+                } else {
+                    console.error(err);
+                    appendMessage('bot', '请求后端失败，请检查服务是否在运行，或稍后再试。', []);
+                    setChatBoxActive(true);
+                    setStatus('异常');
+                }
             } finally {
+                chatInFlight = false;
+                chatAbortController = null;
                 setSendBtnBusy(false);
-                setTimeout(() => setStatus('就绪'), 800);
+                setTimeout(function () { setStatus('就绪'); }, 800);
             }
         }
 
@@ -841,6 +885,11 @@ async def chat_ui() -> str:
             sendBtn.addEventListener('click', function (e) {
                 e.preventDefault();
                 e.stopPropagation();
+                if (chatInFlight && chatAbortController) {
+                    chatCancelReason = 'user';
+                    try { chatAbortController.abort(); } catch (err) {}
+                    return;
+                }
                 sendQuestion();
             });
         }
