@@ -258,12 +258,21 @@ async def chat_ui() -> str:
             overflow-y: auto;
             padding: 12px 0 8px;
         }
-        .history-item {
-            width: 100%;
+        .history-row {
+            display: flex;
+            align-items: stretch;
+            border-bottom: 1px solid #f0f2f7;
+        }
+        .history-row:last-child {
+            border-bottom: none;
+        }
+        .history-item-main {
+            flex: 1;
+            min-width: 0;
             border: none;
             background: transparent;
             text-align: left;
-            padding: 12px 20px;
+            padding: 12px 8px 12px 20px;
             font-size: 15px;
             color: #1f2330;
             cursor: pointer;
@@ -271,12 +280,29 @@ async def chat_ui() -> str:
             line-height: 1.45;
             transition: background 0.15s ease;
         }
-        .history-item:hover {
+        .history-row:hover .history-item-main {
             background: #f3f5fa;
         }
-        .history-item.active {
+        .history-row.active .history-item-main {
             background: #e8edfb;
             color: #355ddf;
+        }
+        .history-item-delete {
+            flex-shrink: 0;
+            width: 44px;
+            border: none;
+            background: transparent;
+            color: #9ca3af;
+            font-size: 20px;
+            line-height: 1;
+            cursor: pointer;
+            padding: 0;
+            font-family: inherit;
+            transition: background 0.15s ease, color 0.15s ease;
+        }
+        .history-item-delete:hover {
+            background: #fee2e2;
+            color: #dc2626;
         }
         .history-empty {
             padding: 24px 20px;
@@ -825,17 +851,48 @@ async def chat_ui() -> str:
             }
             for (var si = 0; si < sessions.length; si++) {
                 (function (sess) {
+                    var row = document.createElement('div');
+                    row.className = 'history-row' + (sess.id === currentSessionId ? ' active' : '');
                     var btn = document.createElement('button');
                     btn.type = 'button';
-                    btn.className = 'history-item' + (sess.id === currentSessionId ? ' active' : '');
+                    btn.className = 'history-item-main';
                     btn.textContent = sess.title || '未命名对话';
                     btn.addEventListener('click', function () {
                         selectHistorySession(sess.id);
                         closeHistoryDrawer();
                     });
-                    historyList.appendChild(btn);
+                    var delBtn = document.createElement('button');
+                    delBtn.type = 'button';
+                    delBtn.className = 'history-item-delete';
+                    delBtn.setAttribute('aria-label', '删除此对话');
+                    delBtn.title = '删除';
+                    delBtn.textContent = '×';
+                    delBtn.addEventListener('click', function (e) {
+                        e.preventDefault();
+                        e.stopPropagation();
+                        deleteHistorySession(sess.id);
+                    });
+                    row.appendChild(btn);
+                    row.appendChild(delBtn);
+                    historyList.appendChild(row);
                 })(sessions[si]);
             }
+        }
+
+        function deleteHistorySession(id) {
+            if (!confirm('确定删除这条历史对话？此操作不可恢复。')) return;
+            var all = loadAllSessionsFromStorage();
+            var next = [];
+            for (var i = 0; i < all.length; i++) {
+                if (all[i].id !== id) next.push(all[i]);
+            }
+            saveAllSessionsToStorage(next);
+            if (id === currentSessionId) {
+                resetChat();
+            }
+            renderHistoryList();
+            setStatus('已删除历史记录');
+            setTimeout(function () { setStatus('就绪'); }, 800);
         }
 
         function selectHistorySession(id) {
