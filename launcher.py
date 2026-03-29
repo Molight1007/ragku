@@ -3,6 +3,7 @@ from __future__ import annotations
 import contextlib
 import io
 import os
+import socket
 import sys
 import threading
 import time
@@ -30,8 +31,15 @@ APP_DIR = _app_base_dir()
 ENV_FILE = APP_DIR / ".env"
 INDEX_STORE = APP_DIR / "index_store.npy"
 INDEX_META = APP_DIR / "index_meta.npy"
+SERVER_PORT = 8000
 
 DEFAULT_DATA_DIR = Path(r"D:\知识库资料20")
+
+
+def _port_in_use(port: int) -> bool:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.settimeout(0.4)
+        return s.connect_ex(("127.0.0.1", port)) == 0
 
 
 def _read_env_key() -> str:
@@ -118,17 +126,26 @@ class LauncherApp:
         Label(bottom, textvariable=self.status_var, font=("Segoe UI", 10)).pack(anchor="w")
 
     def log(self, msg: str) -> None:
-        now = time.strftime("%H:%M:%S")
-        line = f"[{now}] {msg}\n"
-        self.log_text.config(state=NORMAL)
-        self.log_text.insert(END, line)
-        self.log_text.see(END)
-        self.log_text.config(state=DISABLED)
+        """写入日志（可在任意线程调用，实际更新在主线程执行）。"""
+
+        def append() -> None:
+            now = time.strftime("%H:%M:%S")
+            line = f"[{now}] {msg}\n"
+            self.log_text.config(state=NORMAL)
+            self.log_text.insert(END, line)
+            self.log_text.see(END)
+            self.log_text.config(state=DISABLED)
+
+        try:
+            self.root.after(0, append)
+        except Exception:  # noqa: BLE001
+            pass
 
     def _refresh_status(self) -> None:
         key_ok = bool(_read_env_key())
         idx_ok = INDEX_STORE.exists() and INDEX_META.exists()
-        srv_ok = self.uvicorn_server is not None and self.uvicorn_server.started
+        # 以端口是否监听为准（比 uvicorn.started 更可靠；且避免后台线程里读 Tk 导致状态不准）
+        srv_ok = _port_in_use(SERVER_PORT)
 
         parts = []
         parts.append("密钥：已配置" if key_ok else "密钥：未配置")
@@ -225,8 +242,16 @@ class LauncherApp:
         threading.Thread(target=worker, daemon=True).start()
 
     def action_start_server(self) -> None:
-        if self.uvicorn_server is not None and self.uvicorn_server.started:
+        if self.server_thread is not None and self.server_thread.is_alive() and _port_in_use(SERVER_PORT):
             self.log("服务已在运行中。")
+            return
+        if _port_in_use(SERVER_PORT) and (
+            self.server_thread is None or not self.server_thread.is_alive()
+        ):
+            self.log(
+                f"端口 {SERVER_PORT} 已被占用（可能不是本程序启动的服务）。"
+                "请先关闭其它占用该端口的程序后再试。"
+            )
             return
         if not _read_env_key():
             self.log("未配置密钥，请先点击“配置密钥”。")
@@ -244,9 +269,11 @@ class LauncherApp:
         config = uvicorn.Config(
             fastapi_app,
             host="0.0.0.0",
-            port=8000,
+            port=SERVER_PORT,
             log_level="info",
             access_log=False,
+            # 避免部分环境下 uvicorn 默认 logging dictConfig 与 Tk/冻结程序冲突
+            log_config=None,
         )
         self.uvicorn_server = uvicorn.Server(config)
 
@@ -255,33 +282,60 @@ class LauncherApp:
                 self.uvicorn_server.run()
             except Exception as e:  # noqa: BLE001
                 self.log(f"服务启动异常：{e}")
+                import traceback
+
+                self.log(traceback.format_exc())
 
         self.server_thread = threading.Thread(target=run_server, daemon=True)
         self.server_thread.start()
-        self.root.after(1200, self.action_open_chat)
+        self.root.after(800, self._try_open_chat_after_start)
+        self.root.after(2500, self._verify_listening)
+
+    def _try_open_chat_after_start(self) -> None:
+        if _port_in_use(SERVER_PORT):
+            self.action_open_chat()
+        else:
+            self.log("服务仍在启动中，若稍后无法打开页面请查看下方是否有报错。")
+
+    def _verify_listening(self) -> None:
+        if not _port_in_use(SERVER_PORT):
+            alive = self.server_thread is not None and self.server_thread.is_alive()
+            self.log(
+                "未检测到本机端口监听：服务可能启动失败。"
+                + ("" if alive else "（后台线程已结束，请根据上方“服务启动异常”排查）")
+            )
 
     def action_open_chat(self) -> None:
-        webbrowser.open("http://127.0.0.1:8000/chat-ui")
-        self.log("已尝试打开浏览器：/chat-ui")
+        if not _port_in_use(SERVER_PORT):
+            self.log(
+                f"当前 {SERVER_PORT} 端口未监听，服务未就绪。"
+                "请先点击「启动网页」并等待日志提示，或检查是否被其它程序占用端口。"
+            )
+            return
+        webbrowser.open(f"http://127.0.0.1:{SERVER_PORT}/chat-ui")
+        self.log(f"已尝试打开浏览器：http://127.0.0.1:{SERVER_PORT}/chat-ui")
 
     def action_stop_server(self) -> None:
-        if self.uvicorn_server is None or not self.uvicorn_server.started:
+        if self.uvicorn_server is None and not _port_in_use(SERVER_PORT):
             self.log("服务未运行。")
             self.uvicorn_server = None
             return
 
         self.log("正在停止服务……")
         try:
-            self.uvicorn_server.should_exit = True
-            time.sleep(0.8)
+            if self.uvicorn_server is not None:
+                self.uvicorn_server.should_exit = True
+            if self.server_thread is not None:
+                self.server_thread.join(timeout=4)
         except Exception as e:  # noqa: BLE001
             self.log(f"停止服务失败：{e}")
         finally:
             self.uvicorn_server = None
+            self.server_thread = None
             self.log("服务已停止。")
 
     def on_close(self) -> None:
-        if self.uvicorn_server is not None and self.uvicorn_server.started:
+        if self.uvicorn_server is not None or _port_in_use(SERVER_PORT):
             if not messagebox.askyesno("退出确认", "检测到服务仍在运行，是否停止服务并退出？"):
                 return
             self.action_stop_server()
