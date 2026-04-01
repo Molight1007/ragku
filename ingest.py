@@ -125,11 +125,20 @@ def build_embeddings(docs: List[Tuple[str, str]]) -> Tuple[np.ndarray, List[dict
     return np.array(embeddings, dtype="float32"), metadatas
 
 
-def save_index(embeddings: np.ndarray, metadatas: List[dict]) -> None:
+def save_index(
+    embeddings: np.ndarray,
+    metadatas: List[dict],
+    index_file: Path | None = None,
+    meta_file: Path | None = None,
+) -> None:
     """保存向量索引与元数据到本地文件。"""
-    np.save(settings.index_file, embeddings)
-    np.save(settings.meta_file, np.array(metadatas, dtype=object))
-    print(f"索引已保存到: {settings.index_file} 和 {settings.meta_file}")
+    index_path = index_file or settings.index_file
+    meta_path = meta_file or settings.meta_file
+    index_path.parent.mkdir(parents=True, exist_ok=True)
+    meta_path.parent.mkdir(parents=True, exist_ok=True)
+    np.save(index_path, embeddings)
+    np.save(meta_path, np.array(metadatas, dtype=object))
+    print(f"索引已保存到: {index_path} 和 {meta_path}")
 
 
 def main() -> None:

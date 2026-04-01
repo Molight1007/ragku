@@ -9,13 +9,21 @@ from dashscope import Generation
 from config import settings
 
 
-def load_index() -> Tuple[np.ndarray, List[dict]]:
+def load_index(
+    index_file: "str | None" = None,
+    meta_file: "str | None" = None,
+) -> Tuple[np.ndarray, List[dict]]:
     """从本地加载向量索引与元信息。"""
-    if not settings.index_file.exists() or not settings.meta_file.exists():
+    from pathlib import Path
+
+    idx_path = Path(index_file) if index_file else settings.index_file
+    meta_path = Path(meta_file) if meta_file else settings.meta_file
+
+    if not idx_path.exists() or not meta_path.exists():
         raise FileNotFoundError("未找到索引文件，请先运行 ingest.py 构建索引。")
 
-    embeddings = np.load(settings.index_file)
-    metadatas = np.load(settings.meta_file, allow_pickle=True).tolist()
+    embeddings = np.load(idx_path)
+    metadatas = np.load(meta_path, allow_pickle=True).tolist()
     return embeddings, metadatas
 
 
@@ -110,12 +118,16 @@ def generate_answer(prompt: str) -> str:
     return output
 
 
-def rag_answer(query: str) -> Tuple[str, List[dict]]:
+def rag_answer(
+    query: str,
+    index_file: "str | None" = None,
+    meta_file: "str | None" = None,
+) -> Tuple[str, List[dict]]:
     """对外暴露的 RAG 主流程。
 
     返回 (answer, contexts)，方便上层（CLI 或 Web）展示检索到的证据。
     """
-    embeddings, metadatas = load_index()
+    embeddings, metadatas = load_index(index_file=index_file, meta_file=meta_file)
     q_embed = embed_query(query)
     contexts = search_similar_chunks(
         q_embed,

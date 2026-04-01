@@ -8,3 +8,4 @@ pytesseract>=0.3.10
 fastapi>=0.115.0
 uvicorn[standard]>=0.32.0
 pyinstaller>=6.5.0
+python-multipart>=0.0.9
