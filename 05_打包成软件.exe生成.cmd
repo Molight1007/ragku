@@ -44,7 +44,16 @@ if errorlevel 1 (
 )
 
 echo 开始打包...
-.venv\Scripts\python -m PyInstaller --noconfirm --clean --name "RAG启动器" --onefile --windowed launcher.py
+echo 说明：必须打入 app / knowledge_store 等模块，否则 exe 仍可能加载旧版 app.py。
+.venv\Scripts\python -m PyInstaller --noconfirm --clean --name "RAG启动器" --onefile --windowed ^
+  --hidden-import app ^
+  --hidden-import knowledge_store ^
+  --hidden-import ingest ^
+  --hidden-import rag_service ^
+  --hidden-import document_extract ^
+  --hidden-import bailian_ocr ^
+  --hidden-import config ^
+  launcher.py
 if errorlevel 1 (
   echo.
   echo 打包失败，请滚动查看上方报错信息。

@@ -139,10 +139,10 @@ async def api_knowledge_rebuild() -> RebuildResponse:
 
 
 @app.get("/chat-ui", response_class=HTMLResponse)
-async def chat_ui() -> str:
+async def chat_ui() -> Response:
     """中文网页：问答 + 知识库增删与重建索引。"""
     kb_dir = str(settings.default_knowledge_dir)
-    return f"""
+    html = f"""
 <!DOCTYPE html>
 <html lang="zh-CN">
 <head>
@@ -270,7 +270,8 @@ async def chat_ui() -> str:
     <div class="container">
         <h1>本地知识库RAG问答系统</h1>
         <div class="subtitle">
-            基于阿里云通义千问 + 本地多模态知识库 · 问答、溯源与知识库维护
+            基于阿里云通义千问 + 本地多模态知识库 · 问答、溯源与知识库维护<br />
+            <span style="color:#1677ff;font-weight:600;">本页应显示「问答」「知识库」两个标签（页面版本 2026-03-kb）。若看不到，请重新打包 exe 或改用源码启动服务，并强制刷新浏览器（Ctrl+F5）。</span>
         </div>
         <div class="tabs">
             <button type="button" class="active" id="tabChat" onclick="switchTab('chat')">问答</button>
@@ -479,6 +480,13 @@ async def chat_ui() -> str:
 </body>
 </html>
     """
+    return HTMLResponse(
+        content=html,
+        headers={
+            "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+            "Pragma": "no-cache",
+        },
+    )
 
 
 @app.post("/chat", response_model=ChatResponse)
