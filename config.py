@@ -22,8 +22,12 @@ class Settings:
     # 文本向量模型（使用 DashScope 文本向量模型名称）
     embedding_model: str = "text-embedding-v1"
 
-    # 默认知识库路径（可在命令行参数中覆盖）
-    default_knowledge_dir: Path = Path(r"D:\知识库资料20")
+    # 默认知识库路径（可用环境变量 KNOWLEDGE_DIR 覆盖，便于网页与脚本共用）
+    default_knowledge_dir: Path = (
+        Path(os.getenv("KNOWLEDGE_DIR", "").strip())
+        if os.getenv("KNOWLEDGE_DIR", "").strip()
+        else Path(r"D:\知识库资料20")
+    )
 
     # 索引文件保存路径
     index_file: Path = Path("index_store.npy")

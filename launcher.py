@@ -59,9 +59,31 @@ def _read_env_key() -> str:
     return ""
 
 
+def _merge_env_line(key: str, value: str) -> None:
+    """写入或更新 .env 中的一行，保留其它配置（如 KNOWLEDGE_DIR）。"""
+    lines: list[str] = []
+    if ENV_FILE.exists():
+        try:
+            lines = ENV_FILE.read_text(encoding="utf-8", errors="ignore").splitlines()
+        except Exception:  # noqa: BLE001
+            lines = []
+    prefix = f"{key}="
+    out: list[str] = []
+    found = False
+    for line in lines:
+        if line.strip().startswith(prefix):
+            out.append(f"{key}={value}")
+            found = True
+        else:
+            out.append(line)
+    if not found:
+        out.append(f"{key}={value}")
+    ENV_FILE.write_text("\n".join(out).rstrip() + "\n", encoding="utf-8")
+
+
 def _write_env_key(key: str) -> None:
     """将密钥写入 .env（UTF-8）。"""
-    ENV_FILE.write_text(f"DASHSCOPE_API_KEY={key}\n", encoding="utf-8")
+    _merge_env_line("DASHSCOPE_API_KEY", key)
 
 
 def _apply_env_key_to_process() -> None:
@@ -194,7 +216,12 @@ class LauncherApp:
         if not path:
             return
         self.data_dir = Path(path)
-        self.log(f"已选择知识库目录：{self.data_dir}")
+        try:
+            _merge_env_line("KNOWLEDGE_DIR", str(self.data_dir))
+            os.environ["KNOWLEDGE_DIR"] = str(self.data_dir)
+            self.log(f"已选择知识库目录并已写入 .env（KNOWLEDGE_DIR）：{self.data_dir}")
+        except Exception as e:  # noqa: BLE001
+            self.log(f"已选择知识库目录：{self.data_dir}（写入 .env 失败：{e}）")
 
     def action_build_index(self) -> None:
         def worker() -> None:
