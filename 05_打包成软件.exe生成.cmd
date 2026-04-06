@@ -50,8 +50,6 @@ echo 说明：必须打入 app / knowledge_store 等模块，否则 exe 仍可�
   --hidden-import knowledge_store ^
   --hidden-import ingest ^
   --hidden-import rag_service ^
-  --hidden-import document_extract ^
-  --hidden-import bailian_ocr ^
   --hidden-import config ^
   launcher.py
 if errorlevel 1 (
