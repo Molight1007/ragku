@@ -1,21 +1,31 @@
 # -*- mode: python ; coding: utf-8 -*-
 
 
+from pathlib import Path
+
+ROOT = Path.cwd()
+
+datas = []
+for rel in [
+    '.env',
+    'app.py',
+    'config.py',
+    'rag_service.py',
+    'document_extract.py',
+    'ingest.py',
+    'main.py',
+    'index_store.npy',
+    'index_meta.npy',
+]:
+    p = ROOT / rel
+    if p.exists():
+        datas.append((str(p), '.'))
+
 a = Analysis(
     ['launcher.py'],
-    pathex=[],
+    pathex=[str(ROOT)],
     binaries=[],
-    datas=[
-        ('.env', '.'),
-        ('app.py', '.'),
-        ('config.py', '.'),
-        ('rag_service.py', '.'),
-        ('document_extract.py', '.'),
-        ('ingest.py', '.'),
-        ('main.py', '.'),
-        ('index_store.npy', '.'),
-        ('index_meta.npy', '.'),
-    ],
+    datas=datas,
     hiddenimports=[
         'uvicorn',
         'uvicorn.logging',
@@ -28,7 +38,6 @@ a = Analysis(
         'uvicorn.protocols.websockets.auto',
         'uvicorn.lifespan',
         'uvicorn.lifespan.on',
-        'numpy',
         'fastapi',
         'fastapi.middleware',
         'fastapi.middleware.cors',
@@ -36,7 +45,14 @@ a = Analysis(
         'starlette.middleware',
         'starlette.middleware.cors',
         'pydantic',
+        'numpy',
         'dashscope',
+        'app',
+        'config',
+        'rag_service',
+        'document_extract',
+        'ingest',
+        'main',
     ],
     hookspath=[],
     hooksconfig={},

@@ -506,7 +506,13 @@ def main() -> None:
         os.chdir(str(APP_DIR))
         import uvicorn
 
-        uvicorn.run("app:app", host="0.0.0.0", port=int(args.port), log_level="info")
+        try:
+            from app import app as fastapi_app
+        except Exception as e:  # noqa: BLE001
+            print(f"[启动失败] 导入 app 模块异常: {e}")
+            raise
+
+        uvicorn.run(fastapi_app, host="0.0.0.0", port=int(args.port), log_level="info")
         return
 
     if "--console" in sys.argv:

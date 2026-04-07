@@ -789,12 +789,16 @@ async def chat_ui() -> str:
             resize: none;
             overflow-y: auto;
             font-family: inherit;
+            font-weight: 400;
             color: #1f2330;
+            padding: 8px 0;
         }
         .question-input::placeholder {
             font-size: inherit;
+            line-height: inherit;
+            font-family: inherit;
+            font-weight: 400;
             color: #b6b9c3;
-            font-weight: 500;
         }
         .composer-bottom {
             margin-top: 0;
