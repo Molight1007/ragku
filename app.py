@@ -2185,6 +2185,13 @@ async def chat_ui() -> str:
             const bubble = document.createElement('div');
             bubble.className = 'bubble';
             bubble.textContent = text;
+            if (text === '未选择知识库文件' || text === '当前并未选择文件' || text === '当前并未选择知识库文件') {
+                bubble.classList.add('no-wrap');
+            }
+
+            if (bubble.classList.contains('no-wrap')) {
+                bubble.style.maxWidth = 'none';
+            }
 
             if (role === 'user') {
                 wrap.appendChild(bubble);
@@ -2623,6 +2630,10 @@ async def chat(body: ChatRequest) -> ChatResponse:
     try:
         selected_files = [str(x) for x in (body.selected_files or []) if str(x).strip()]
         resolved_kb = _resolve_rag_kb_id(body.kb_id)
+
+        if (body.kb_id or "").strip() and not selected_files:
+            return ChatResponse(answer="未选择知识库文件", contexts=[])
+
         if selected_files:
             answer, contexts_raw = rag_answer_filtered(
                 _effective_rag_query(q, a),
