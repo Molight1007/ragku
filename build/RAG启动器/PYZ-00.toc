@@ -2524,7 +2524,6 @@
   ('lzma',
    'C:\\Users\\TiAmo\\AppData\\Local\\Programs\\Python\\Python314\\Lib\\lzma.py',
    'PYMODULE'),
-  ('main', 'E:\\ragku\\main.py', 'PYMODULE'),
   ('mimetypes',
    'C:\\Users\\TiAmo\\AppData\\Local\\Programs\\Python\\Python314\\Lib\\mimetypes.py',
    'PYMODULE'),

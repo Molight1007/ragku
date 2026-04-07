@@ -1,9 +1,14 @@
 from __future__ import annotations
 
+import asyncio
 import shutil
+import threading
 import uuid
+from http import HTTPStatus
 from pathlib import Path
 from typing import List, Optional
+
+import dashscope
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import HTMLResponse
@@ -127,6 +132,15 @@ class KnowledgeBaseListResponse(BaseModel):
     items: List[KnowledgeBaseInfo]
 
 
+class KnowledgeBaseUploadProgress(BaseModel):
+    """知识库上传后分片向量化进度。"""
+
+    total_chunks: int
+    processed_chunks: int
+    done: bool
+    message: str = ""
+
+
 app = FastAPI(
     title="本地知识库RAG问答系统",
     description="基于阿里云通义千问 + 本地多模态知识库的RAG服务，用于大赛展示。",
@@ -225,10 +239,72 @@ def _collect_documents_for_kb(data_dir: Path) -> List[tuple[str, str]]:
     return collect_documents(data_dir)
 
 
-def _build_embeddings_for_kb(docs: List[tuple[str, str]]):
-    from ingest import build_embeddings
+KB_UPLOAD_PROGRESS: dict[str, dict] = {}
+KB_UPLOAD_LOCK = threading.Lock()
+KB_REBUILD_RUNNING: set[str] = set()
 
-    return build_embeddings(docs)
+
+def _build_embeddings_for_kb_with_progress(docs: List[tuple[str, str]], kb_id: str):
+    if not settings.dashscope_api_key:
+        raise RuntimeError("未检测到 DASHSCOPE_API_KEY，请先在环境变量或 .env 中配置。")
+
+    if not docs:
+        raise RuntimeError("没有可向量化的文本分片。")
+
+    from dashscope import TextEmbedding
+
+    dashscope.api_key = settings.dashscope_api_key
+
+    embeddings: List[List[float]] = []
+    metadatas: List[dict] = []
+    total = len(docs)
+
+    with KB_UPLOAD_LOCK:
+        KB_UPLOAD_PROGRESS[kb_id] = {
+            "total": total,
+            "processed": 0,
+            "done": False,
+            "message": "开始分片向量化",
+        }
+
+    for idx, (source, text) in enumerate(docs, start=1):
+        try:
+            resp = TextEmbedding.call(model=settings.embedding_model, input=text)
+            status = getattr(resp, "status_code", None)
+            if status != HTTPStatus.OK:
+                code = getattr(resp, "code", "")
+                msg = getattr(resp, "message", "") or str(resp)
+                with KB_UPLOAD_LOCK:
+                    KB_UPLOAD_PROGRESS[kb_id]["processed"] = idx
+                    KB_UPLOAD_PROGRESS[kb_id]["message"] = f"第 {idx}/{total} 分片失败: {code} {msg}".strip()
+                continue
+
+            output = resp.output if hasattr(resp, "output") else resp["output"]
+            emb_list = output["embeddings"] if isinstance(output, dict) else output.embeddings
+            vector = emb_list[0]["embedding"] if isinstance(emb_list[0], dict) else emb_list[0].embedding
+            embeddings.append(list(vector))
+            metadatas.append({"source": source, "text": text})
+        except Exception as e:  # noqa: BLE001
+            with KB_UPLOAD_LOCK:
+                KB_UPLOAD_PROGRESS[kb_id]["processed"] = idx
+                KB_UPLOAD_PROGRESS[kb_id]["message"] = f"第 {idx}/{total} 分片异常: {e}"
+            continue
+
+        with KB_UPLOAD_LOCK:
+            KB_UPLOAD_PROGRESS[kb_id]["processed"] = idx
+            KB_UPLOAD_PROGRESS[kb_id]["message"] = f"分片向量化进度 {idx}/{total}"
+
+    if not embeddings:
+        with KB_UPLOAD_LOCK:
+            KB_UPLOAD_PROGRESS[kb_id]["done"] = True
+            KB_UPLOAD_PROGRESS[kb_id]["message"] = "未成功生成任何向量"
+        raise RuntimeError("未成功生成任何向量，请检查密钥、模型或网络。")
+
+    with KB_UPLOAD_LOCK:
+        KB_UPLOAD_PROGRESS[kb_id]["done"] = True
+        KB_UPLOAD_PROGRESS[kb_id]["message"] = "向量化完成"
+
+    return np.array(embeddings, dtype="float32"), metadatas
 
 
 def _list_kb_items() -> List[KnowledgeBaseInfo]:
@@ -300,16 +376,69 @@ async def api_kb_upload(kb_id: str = Form(...), file: UploadFile = File(...)) ->
     stored = f"{uuid.uuid4().hex[:12]}_{safe_upload_name(file.filename)}"
     (files_dir / stored).write_bytes(data)
 
-    docs = _collect_documents_for_kb(files_dir)
-    if not docs:
-        raise HTTPException(status_code=422, detail="知识库未提取到可向量化文本")
-    embeddings, metadatas = _build_embeddings_for_kb(docs)
-    np.save(_kb_index_file(safe_id), embeddings)
-    np.save(_kb_meta_file(safe_id), np.array(metadatas, dtype=object))
+    with KB_UPLOAD_LOCK:
+        if safe_id in KB_REBUILD_RUNNING:
+            kb_name = _kb_name_file(safe_id).read_text(encoding="utf-8", errors="ignore").strip() or safe_id
+            file_count = len([x for x in files_dir.rglob("*") if x.is_file()])
+            return KnowledgeBaseInfo(id=safe_id, name=kb_name, file_count=file_count)
+        KB_REBUILD_RUNNING.add(safe_id)
+        KB_UPLOAD_PROGRESS[safe_id] = {
+            "total": 1,
+            "processed": 0,
+            "done": False,
+            "message": "文件已上传，等待重建索引",
+        }
+
+    async def _rebuild() -> None:
+        try:
+            docs = await asyncio.to_thread(_collect_documents_for_kb, files_dir)
+            if not docs:
+                with KB_UPLOAD_LOCK:
+                    KB_UPLOAD_PROGRESS[safe_id] = {
+                        "total": 0,
+                        "processed": 0,
+                        "done": True,
+                        "message": "知识库未提取到可向量化文本",
+                    }
+                return
+            embeddings, metadatas = await asyncio.to_thread(_build_embeddings_for_kb_with_progress, docs, safe_id)
+            await asyncio.to_thread(np.save, _kb_index_file(safe_id), embeddings)
+            await asyncio.to_thread(np.save, _kb_meta_file(safe_id), np.array(metadatas, dtype=object))
+            with KB_UPLOAD_LOCK:
+                p = KB_UPLOAD_PROGRESS.get(safe_id, {})
+                p["done"] = True
+                p["message"] = "索引重建完成"
+                KB_UPLOAD_PROGRESS[safe_id] = p
+        except Exception as e:  # noqa: BLE001
+            with KB_UPLOAD_LOCK:
+                p = KB_UPLOAD_PROGRESS.get(safe_id, {"total": 0, "processed": 0})
+                p["done"] = True
+                p["message"] = f"索引重建失败: {e}"
+                KB_UPLOAD_PROGRESS[safe_id] = p
+        finally:
+            with KB_UPLOAD_LOCK:
+                KB_REBUILD_RUNNING.discard(safe_id)
+
+    asyncio.create_task(_rebuild())
 
     kb_name = _kb_name_file(safe_id).read_text(encoding="utf-8", errors="ignore").strip() or safe_id
     file_count = len([x for x in files_dir.rglob("*") if x.is_file()])
     return KnowledgeBaseInfo(id=safe_id, name=kb_name, file_count=file_count)
+
+
+@app.get("/api/kb/{kb_id}/progress", response_model=KnowledgeBaseUploadProgress)
+async def api_kb_progress(kb_id: str) -> KnowledgeBaseUploadProgress:
+    safe_id = _safe_kb_id(kb_id)
+    with KB_UPLOAD_LOCK:
+        p = KB_UPLOAD_PROGRESS.get(safe_id)
+    if not p:
+        return KnowledgeBaseUploadProgress(total_chunks=0, processed_chunks=0, done=True, message="暂无任务")
+    return KnowledgeBaseUploadProgress(
+        total_chunks=int(p.get("total", 0)),
+        processed_chunks=int(p.get("processed", 0)),
+        done=bool(p.get("done", False)),
+        message=str(p.get("message", "")),
+    )
 
 
 @app.delete("/api/kb/{kb_id}")
@@ -987,7 +1116,7 @@ async def chat_ui() -> str:
             </div>
         </div>
     </aside>
-    <input type="file" id="kbFileInput" accept=".txt,.md,.pdf,.docx,.jpg,.jpeg,.png,.bmp,.webp,.gif" style="display:none" />
+    <input type="file" id="kbFileInput" accept=".txt,.md,.pdf,.docx,.jpg,.jpeg,.png,.bmp,.webp,.gif" multiple style="display:none" />
     <input type="file" id="fileCamera" accept="image/*" capture="environment" style="display:none" />
     <input type="file" id="fileImage" accept="image/*" multiple style="display:none" />
     <input type="file" id="fileDoc" accept=".txt,.md,.pdf,.docx,.jpg,.jpeg,.png,.bmp,.webp,.gif" multiple style="display:none" />
@@ -1738,29 +1867,116 @@ async def chat_ui() -> str:
                 }
             });
         }
+        async function uploadKbFileWithProgress(kbId, file, index, total) {
+            return await new Promise(function (resolve, reject) {
+                var xhr = new XMLHttpRequest();
+                xhr.open('POST', apiUrl('/api/kb/upload'));
+                xhr.responseType = 'json';
+
+                xhr.upload.onprogress = function (evt) {
+                    if (evt.lengthComputable && evt.total > 0) {
+                        var p = Math.round((evt.loaded / evt.total) * 100);
+                        setStatus('文件传输中（' + index + '/' + total + '）：' + file.name + ' ' + p + '%');
+                    } else {
+                        setStatus('文件传输中（' + index + '/' + total + '）：' + file.name);
+                    }
+                };
+
+                xhr.onload = function () {
+                    var data = xhr.response;
+                    if (!data && xhr.responseText) {
+                        try { data = JSON.parse(xhr.responseText); } catch (e) {}
+                    }
+                    if (xhr.status >= 200 && xhr.status < 300) {
+                        resolve(data || {});
+                    } else {
+                        reject(new Error((data && data.detail) ? data.detail : ('HTTP ' + xhr.status)));
+                    }
+                };
+
+                xhr.onerror = function () {
+                    reject(new Error('网络错误，上传失败'));
+                };
+
+                var fd = new FormData();
+                fd.append('kb_id', kbId);
+                fd.append('file', file, file.name);
+                xhr.send(fd);
+            });
+        }
+
+        async function waitKbRebuildProgress(kbId) {
+            var maxLoop = 360;
+            for (var i = 0; i < maxLoop; i++) {
+                let resp;
+                try {
+                    resp = await fetch(apiUrl('/api/kb/' + encodeURIComponent(kbId) + '/progress'));
+                } catch (err) {
+                    setStatus('查询分片进度失败，稍后重试…');
+                    await new Promise(function (r) { setTimeout(r, 700); });
+                    continue;
+                }
+                const data = await resp.json().catch(function () { return {}; });
+                if (!resp.ok) {
+                    setStatus('查询分片进度失败：HTTP ' + resp.status);
+                    await new Promise(function (r) { setTimeout(r, 700); });
+                    continue;
+                }
+
+                var total = Number(data.total_chunks || 0);
+                var done = Number(data.processed_chunks || 0);
+                var msg = data.message || '';
+                if (total > 0) {
+                    var p = Math.max(0, Math.min(100, Math.round(done * 100 / total)));
+                    setStatus('分片处理中：' + done + '/' + total + '（' + p + '%）' + (msg ? ' - ' + msg : ''));
+                } else {
+                    setStatus(msg || '分片处理中…');
+                }
+
+                if (data.done) {
+                    if (msg && msg.indexOf('失败') >= 0) {
+                        throw new Error(msg);
+                    }
+                    return;
+                }
+                await new Promise(function (r) { setTimeout(r, 700); });
+            }
+            throw new Error('等待分片进度超时');
+        }
+
         if (kbFileInput) {
             kbFileInput.addEventListener('change', async function (e) {
-                var f = e.target.files && e.target.files[0];
+                var files = Array.from(e.target.files || []);
                 e.target.value = '';
-                if (!f) return;
+                if (!files.length) return;
                 if (!kbUploadTargetId) {
                     setStatus('请先选择知识库再上传');
                     return;
                 }
-                setStatus('正在上传并构建索引，请稍候…');
+
+                var total = files.length;
+                var ok = 0;
+                var lastData = null;
                 try {
-                    var fd = new FormData();
-                    fd.append('kb_id', kbUploadTargetId);
-                    fd.append('file', f, f.name);
-                    const resp = await fetch(apiUrl('/api/kb/upload'), { method: 'POST', body: fd });
-                    const data = await resp.json();
-                    if (!resp.ok) throw new Error((data && data.detail) ? data.detail : ('HTTP ' + resp.status));
-                    selectedKbId = data.id;
-                    localStorage.setItem(KB_SELECTED_KEY, selectedKbId);
+                    for (var i = 0; i < files.length; i++) {
+                        var f = files[i];
+                        var idx = i + 1;
+                        setStatus('准备上传（' + idx + '/' + total + '）：' + f.name);
+                        var data = await uploadKbFileWithProgress(kbUploadTargetId, f, idx, total);
+                        lastData = data;
+                        ok++;
+                        await waitKbRebuildProgress(kbUploadTargetId);
+                    }
+
+                    if (lastData && lastData.id) {
+                        selectedKbId = lastData.id;
+                        localStorage.setItem(KB_SELECTED_KEY, selectedKbId);
+                    }
                     await refreshKbListAndRender();
-                    setStatus('已上传并更新知识库：' + (data.name || data.id));
+                    setStatus('知识库导入完成：成功 ' + ok + ' / ' + total);
                 } catch (err) {
-                    setStatus('知识库上传失败：' + (err.message || err));
+                    await refreshKbListAndRender();
+                    setStatus('知识库导入中断：已成功 ' + ok + ' / ' + total + '，原因：' + (err.message || err));
                 } finally {
                     kbUploadTargetId = null;
                 }
