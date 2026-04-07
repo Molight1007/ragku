@@ -17,7 +17,7 @@ import numpy as np
 from pydantic import BaseModel
 
 from config import settings
-from rag_service import rag_answer, rag_answer_filtered
+from rag_service import load_index, rag_answer, rag_answer_filtered
 
 MAX_UPLOAD_BYTES = 15 * 1024 * 1024
 LEGACY_KB_ID = "legacy_fire"
@@ -457,7 +457,15 @@ async def api_kb_progress(kb_id: str) -> KnowledgeBaseUploadProgress:
 async def api_kb_files(kb_id: str) -> KnowledgeBaseFileListResponse:
     safe_id = _safe_kb_id(kb_id)
     if safe_id == LEGACY_KB_ID:
-        return KnowledgeBaseFileListResponse(kb_id=safe_id, items=[])
+        if not _legacy_index_exists():
+            return KnowledgeBaseFileListResponse(kb_id=safe_id, items=[])
+        try:
+            _, metas = load_index(None)
+        except Exception:
+            return KnowledgeBaseFileListResponse(kb_id=safe_id, items=[])
+        names = sorted({Path(str(m.get("source", "") or "")).name for m in metas if str(m.get("source", "") or "")})
+        items = [KnowledgeBaseFileItem(name=n, rel_path=n, size=0) for n in names]
+        return KnowledgeBaseFileListResponse(kb_id=safe_id, items=items)
 
     base = _kb_dir(safe_id)
     if not base.exists() or not base.is_dir():
@@ -1419,6 +1427,10 @@ async def chat_ui() -> str:
         let kbUploadTargetId = null;
         let kbDetailOpenForId = null;
 
+        function cleanDisplayFileName(name) {
+            return String(name || '').replace(/^[0-9a-f]{12}_/i, '');
+        }
+
         function loadKbFileSelectionMap() {
             try {
                 var raw = localStorage.getItem(KB_FILE_SELECTED_KEY);
@@ -1724,7 +1736,7 @@ async def chat_ui() -> str:
 
                 var selectedAllNow = getSelectedFilesForKb(kb.id);
                 var allKeys = files.map(function (f) {
-                    return String((f.name || '').replace(/^[0-9a-f]{12}_/i, ''));
+                    return cleanDisplayFileName(f.name || '');
                 });
                 var allPicked = allKeys.length > 0 && allKeys.every(function (k) { return selectedAllNow.indexOf(k) >= 0; });
 
@@ -1746,7 +1758,7 @@ async def chat_ui() -> str:
                 if (!files.length) {
                     var empty = document.createElement('div');
                     empty.className = 'history-empty';
-                    empty.textContent = kb.id === 'legacy_fire' ? '默认“消防”不展示原始文件列表' : '该知识库暂无文件';
+                    empty.textContent = '该知识库暂无文件';
                     kbLinkedList.appendChild(empty);
                     return;
                 }
@@ -1762,7 +1774,7 @@ async def chat_ui() -> str:
                         var n = document.createElement('div');
                         n.className = 'kb-file-name';
                         var rawName = f.name || f.rel_path || '未命名文件';
-                        n.textContent = String(rawName).replace(/^[0-9a-f]{12}_/i, '');
+                        n.textContent = cleanDisplayFileName(rawName);
                         var m = document.createElement('div');
                         m.className = 'kb-file-meta';
                         m.textContent = '大小：' + _fmtSize(f.size || 0);
@@ -1775,7 +1787,7 @@ async def chat_ui() -> str:
                         pick.title = '选择文件';
                         pick.textContent = '✓';
 
-                        var fileKey = (f.name || '').replace(/^[0-9a-f]{12}_/i, '');
+                        var fileKey = cleanDisplayFileName(f.name || '');
                         var selectedFiles = getSelectedFilesForKb(kb.id);
                         var isPicked = selectedFiles.indexOf(fileKey) >= 0;
                         pick.classList.toggle('selected', isPicked);
@@ -2611,7 +2623,7 @@ async def chat(body: ChatRequest) -> ChatResponse:
     try:
         selected_files = [str(x) for x in (body.selected_files or []) if str(x).strip()]
         resolved_kb = _resolve_rag_kb_id(body.kb_id)
-        if selected_files and resolved_kb:
+        if selected_files:
             answer, contexts_raw = rag_answer_filtered(
                 _effective_rag_query(q, a),
                 kb_id=resolved_kb,

@@ -170,7 +170,7 @@ def _filter_index_by_files(
     return np.stack(kept_vecs), kept_meta
 
 
-def rag_answer_filtered(query: str, kb_id: str, selected_files: List[str]) -> Tuple[str, List[dict]]:
+def rag_answer_filtered(query: str, kb_id: str | None, selected_files: List[str]) -> Tuple[str, List[dict]]:
     embeddings, metadatas = load_index(kb_id=kb_id)
     f_embeddings, f_meta = _filter_index_by_files(embeddings, metadatas, selected_files)
     if f_embeddings.shape[0] == 0:
