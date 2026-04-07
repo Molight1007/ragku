@@ -1269,7 +1269,7 @@ async def chat_ui() -> str:
             </button>
             <button type="button" class="clear-btn" onclick="resetChat()">新对话</button>
         </div>
-        <div class="welcome" id="welcomeText">你好，欢迎使用知识库问答</div>
+        <div class="welcome" id="welcomeText">你好，欢迎使用你的个人知识库</div>
         <div class="chat-box" id="chatBox"></div>
         <div class="composer-wrap">
             <div class="composer">
@@ -1773,6 +1773,7 @@ async def chat_ui() -> str:
                     delBtn.setAttribute('aria-label', '删除此对话');
                     delBtn.title = '删除';
                     delBtn.textContent = '×';
+                    delBtn.classList.add('kb-delete-x');
                     delBtn.addEventListener('click', function (e) {
                         e.preventDefault();
                         e.stopPropagation();
