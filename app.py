@@ -141,6 +141,17 @@ class KnowledgeBaseUploadProgress(BaseModel):
     message: str = ""
 
 
+class KnowledgeBaseFileItem(BaseModel):
+    name: str
+    rel_path: str
+    size: int
+
+
+class KnowledgeBaseFileListResponse(BaseModel):
+    kb_id: str
+    items: List[KnowledgeBaseFileItem]
+
+
 app = FastAPI(
     title="本地知识库RAG问答系统",
     description="基于阿里云通义千问 + 本地多模态知识库的RAG服务，用于大赛展示。",
@@ -441,6 +452,92 @@ async def api_kb_progress(kb_id: str) -> KnowledgeBaseUploadProgress:
     )
 
 
+@app.get("/api/kb/{kb_id}/files", response_model=KnowledgeBaseFileListResponse)
+async def api_kb_files(kb_id: str) -> KnowledgeBaseFileListResponse:
+    safe_id = _safe_kb_id(kb_id)
+    if safe_id == LEGACY_KB_ID:
+        return KnowledgeBaseFileListResponse(kb_id=safe_id, items=[])
+
+    base = _kb_dir(safe_id)
+    if not base.exists() or not base.is_dir():
+        raise HTTPException(status_code=404, detail="知识库不存在")
+
+    files_dir = _kb_files_dir(safe_id)
+    items: List[KnowledgeBaseFileItem] = []
+    if files_dir.exists():
+        for p in files_dir.rglob("*"):
+            if not p.is_file():
+                continue
+            rel = str(p.relative_to(files_dir)).replace("\\", "/")
+            items.append(KnowledgeBaseFileItem(name=p.name, rel_path=rel, size=int(p.stat().st_size)))
+    items.sort(key=lambda x: x.rel_path)
+    return KnowledgeBaseFileListResponse(kb_id=safe_id, items=items)
+
+
+@app.delete("/api/kb/{kb_id}/file")
+async def api_kb_delete_file(kb_id: str, rel_path: str) -> dict:
+    safe_id = _safe_kb_id(kb_id)
+    if safe_id == LEGACY_KB_ID:
+        raise HTTPException(status_code=400, detail="默认“消防”知识库不支持删除文件")
+
+    base = _kb_dir(safe_id)
+    if not base.exists() or not base.is_dir():
+        raise HTTPException(status_code=404, detail="知识库不存在")
+
+    files_dir = _kb_files_dir(safe_id)
+    target = (files_dir / (rel_path or "")).resolve()
+    if not str(target).startswith(str(files_dir.resolve())):
+        raise HTTPException(status_code=400, detail="非法文件路径")
+    if not target.exists() or not target.is_file():
+        raise HTTPException(status_code=404, detail="文件不存在")
+
+    target.unlink()
+
+    async def _rebuild_after_delete() -> None:
+        with KB_UPLOAD_LOCK:
+            KB_REBUILD_RUNNING.add(safe_id)
+            KB_UPLOAD_PROGRESS[safe_id] = {
+                "total": 1,
+                "processed": 0,
+                "done": False,
+                "message": "文件删除后重建索引中",
+            }
+        try:
+            docs = await asyncio.to_thread(_collect_documents_for_kb, files_dir)
+            if not docs:
+                for fp in (_kb_index_file(safe_id), _kb_meta_file(safe_id)):
+                    if fp.exists():
+                        fp.unlink()
+                with KB_UPLOAD_LOCK:
+                    KB_UPLOAD_PROGRESS[safe_id] = {
+                        "total": 0,
+                        "processed": 0,
+                        "done": True,
+                        "message": "已无可索引文件，索引已清空",
+                    }
+                return
+            embeddings, metadatas = await asyncio.to_thread(_build_embeddings_for_kb_with_progress, docs, safe_id)
+            await asyncio.to_thread(np.save, _kb_index_file(safe_id), embeddings)
+            await asyncio.to_thread(np.save, _kb_meta_file(safe_id), np.array(metadatas, dtype=object))
+            with KB_UPLOAD_LOCK:
+                p = KB_UPLOAD_PROGRESS.get(safe_id, {})
+                p["done"] = True
+                p["message"] = "索引重建完成"
+                KB_UPLOAD_PROGRESS[safe_id] = p
+        except Exception as e:  # noqa: BLE001
+            with KB_UPLOAD_LOCK:
+                p = KB_UPLOAD_PROGRESS.get(safe_id, {"total": 0, "processed": 0})
+                p["done"] = True
+                p["message"] = f"索引重建失败: {e}"
+                KB_UPLOAD_PROGRESS[safe_id] = p
+        finally:
+            with KB_UPLOAD_LOCK:
+                KB_REBUILD_RUNNING.discard(safe_id)
+
+    asyncio.create_task(_rebuild_after_delete())
+    return {"ok": True}
+
+
 @app.delete("/api/kb/{kb_id}")
 async def api_kb_delete(kb_id: str) -> dict:
     safe_id = _safe_kb_id(kb_id)
@@ -556,6 +653,86 @@ async def chat_ui() -> str:
         .history-drawer.open {
             transform: translateX(0);
         }
+        .kb-linked-panel {
+            position: fixed;
+            top: 0;
+            left: min(82vw, 340px);
+            bottom: 0;
+            width: min(42vw, 420px);
+            background: #ffffff;
+            z-index: 1001;
+            box-shadow: 8px 0 32px rgba(28, 39, 64, 0.10);
+            border-left: 1px solid #eef0f5;
+            display: flex;
+            flex-direction: column;
+            opacity: 0;
+            pointer-events: none;
+            transform: translateX(0);
+            transition: opacity 0.2s ease;
+        }
+        .kb-linked-panel.open {
+            opacity: 1;
+            pointer-events: auto;
+        }
+        .kb-linked-head {
+            padding: 18px 16px 12px;
+            border-bottom: 1px solid #eef0f5;
+            font-size: 16px;
+            font-weight: 700;
+        }
+        .kb-linked-list {
+            flex: 1;
+            min-height: 0;
+            overflow-y: auto;
+            padding: 10px 12px 12px;
+        }
+        .kb-file-row {
+            border: 1px solid #edf0f5;
+            border-radius: 10px;
+            background: #fafbff;
+            padding: 8px;
+            margin-bottom: 8px;
+        }
+        .kb-file-row-top {
+            display: flex;
+            justify-content: space-between;
+            gap: 8px;
+            align-items: flex-start;
+        }
+        .kb-file-del {
+            width: 28px;
+            height: 28px;
+            padding: 0;
+            border: 1px solid #d9dbe2;
+            border-radius: 8px;
+            background: #fff;
+            font-size: 18px;
+            line-height: 1;
+            color: #9ca3af;
+            cursor: pointer;
+            transition: background 0.15s ease, color 0.15s ease, border-color 0.15s ease;
+        }
+        .kb-file-del:hover {
+            background: #fee2e2;
+            color: #dc2626;
+            border-color: #fecaca;
+        }
+        .kb-file-del:disabled {
+            cursor: not-allowed;
+            color: #c4c7cf;
+            background: #f6f7fa;
+            border-color: #e5e7eb;
+        }
+        .kb-file-name {
+            font-size: 11px;
+            color: #1f2330;
+            word-break: break-all;
+        }
+        .kb-file-meta {
+            font-size: 11px;
+            color: #6b7280;
+            margin-top: 3px;
+        }
         .history-drawer-inner {
             flex: 1;
             min-height: 0;
@@ -646,13 +823,13 @@ async def chat_ui() -> str:
             margin-bottom: 8px;
         }
         .kb-name {
-            font-size: 14px;
+            font-size: 12px;
             font-weight: 600;
             color: #1f2330;
             word-break: break-all;
         }
         .kb-meta {
-            font-size: 12px;
+            font-size: 11px;
             color: #6b7280;
         }
         .kb-actions {
@@ -666,6 +843,27 @@ async def chat_ui() -> str:
             font-size: 12px;
             padding: 6px 8px;
             cursor: pointer;
+        }
+        .kb-delete-x {
+            width: 28px;
+            height: 28px;
+            padding: 0;
+            border-radius: 8px;
+            font-size: 18px;
+            line-height: 1;
+            color: #9ca3af;
+            transition: background 0.15s ease, color 0.15s ease, border-color 0.15s ease;
+        }
+        .kb-delete-x:hover {
+            background: #fee2e2;
+            color: #dc2626;
+            border-color: #fecaca;
+        }
+        .kb-delete-x:disabled {
+            cursor: not-allowed;
+            color: #c4c7cf;
+            background: #f6f7fa;
+            border-color: #e5e7eb;
         }
         .history-row {
             display: flex;
@@ -1116,6 +1314,10 @@ async def chat_ui() -> str:
             </div>
         </div>
     </aside>
+    <aside id="kbLinkedPanel" class="kb-linked-panel" aria-hidden="true">
+        <div id="kbLinkedHead" class="kb-linked-head">知识库文件</div>
+        <div id="kbLinkedList" class="kb-linked-list"></div>
+    </aside>
     <input type="file" id="kbFileInput" accept=".txt,.md,.pdf,.docx,.jpg,.jpeg,.png,.bmp,.webp,.gif" multiple style="display:none" />
     <input type="file" id="fileCamera" accept="image/*" capture="environment" style="display:none" />
     <input type="file" id="fileImage" accept="image/*" multiple style="display:none" />
@@ -1147,6 +1349,9 @@ async def chat_ui() -> str:
         const kbCreateBtn = document.getElementById('kbCreateBtn');
         const kbList = document.getElementById('kbList');
         const kbFileInput = document.getElementById('kbFileInput');
+        const kbLinkedPanel = document.getElementById('kbLinkedPanel');
+        const kbLinkedHead = document.getElementById('kbLinkedHead');
+        const kbLinkedList = document.getElementById('kbLinkedList');
 
         const STORAGE_KEY = 'ragku_chat_sessions_v1';
         const KB_SELECTED_KEY = 'ragku_selected_kb_id_v1';
@@ -1160,6 +1365,7 @@ async def chat_ui() -> str:
         let kbItems = [];
         let selectedKbId = localStorage.getItem(KB_SELECTED_KEY) || null;
         let kbUploadTargetId = null;
+        let kbDetailOpenForId = null;
 
         function apiUrl(path) {
             var base = (window.location.origin && window.location.origin !== 'null')
@@ -1264,6 +1470,10 @@ async def chat_ui() -> str:
                 historyDrawer.classList.remove('open');
                 historyDrawer.setAttribute('aria-hidden', 'true');
             }
+            if (kbLinkedPanel) {
+                kbLinkedPanel.classList.remove('open');
+                kbLinkedPanel.setAttribute('aria-hidden', 'true');
+            }
         }
 
         function setDrawerTab(tab) {
@@ -1272,6 +1482,11 @@ async def chat_ui() -> str:
             if (tabKb) tabKb.classList.toggle('active', !isHistory);
             if (panelHistory) panelHistory.classList.toggle('active', isHistory);
             if (panelKb) panelKb.classList.toggle('active', !isHistory);
+            if (isHistory && kbLinkedPanel) {
+                kbLinkedPanel.classList.remove('open');
+                kbLinkedPanel.setAttribute('aria-hidden', 'true');
+                kbDetailOpenForId = null;
+            }
         }
 
         async function fetchKbList() {
@@ -1305,7 +1520,7 @@ async def chat_ui() -> str:
             for (var i = 0; i < kbItems.length; i++) {
                 (function (kb) {
                     var item = document.createElement('div');
-                    item.className = 'kb-item' + (kb.id === selectedKbId ? ' active' : '');
+                    item.className = 'kb-item' + (kb.id === kbDetailOpenForId ? ' active' : '');
 
                     var head = document.createElement('div');
                     head.className = 'kb-head';
@@ -1322,6 +1537,22 @@ async def chat_ui() -> str:
                     head.appendChild(nameWrap);
                     item.appendChild(head);
 
+                    item.addEventListener('click', async function (evt) {
+                        if (evt.target && evt.target.closest('.kb-actions')) return;
+                        if (kbDetailOpenForId === kb.id) {
+                            kbDetailOpenForId = null;
+                            if (kbLinkedPanel) {
+                                kbLinkedPanel.classList.remove('open');
+                                kbLinkedPanel.setAttribute('aria-hidden', 'true');
+                            }
+                            renderKbList();
+                            return;
+                        }
+                        kbDetailOpenForId = kb.id;
+                        renderKbList();
+                        await openKbLinkedPanel(kb);
+                    });
+
                     var actions = document.createElement('div');
                     actions.className = 'kb-actions';
 
@@ -1332,7 +1563,7 @@ async def chat_ui() -> str:
                         selectedKbId = kb.id;
                         localStorage.setItem(KB_SELECTED_KEY, kb.id);
                         renderKbList();
-                        setStatus('已切换知识库：' + (kb.name || kb.id));
+                        setStatus('已切换问答知识库：' + (kb.name || kb.id));
                     });
 
                     var uploadBtn = document.createElement('button');
@@ -1341,7 +1572,7 @@ async def chat_ui() -> str:
                     uploadBtn.disabled = kb.id === 'legacy_fire';
                     uploadBtn.addEventListener('click', function () {
                         if (kb.id === 'legacy_fire') {
-                            setStatus('“消防”是历史默认索引，不支持直接上传，请新建知识库后上传');
+                            setStatus('“消防”为默认知识库，不支持上传');
                             return;
                         }
                         kbUploadTargetId = kb.id;
@@ -1350,7 +1581,10 @@ async def chat_ui() -> str:
 
                     var deleteBtn = document.createElement('button');
                     deleteBtn.type = 'button';
-                    deleteBtn.textContent = '删除';
+                    deleteBtn.className = 'kb-delete-x';
+                    deleteBtn.textContent = '×';
+                    deleteBtn.title = '删除知识库';
+                    deleteBtn.disabled = kb.id === 'legacy_fire';
                     deleteBtn.addEventListener('click', async function () {
                         var ok = window.confirm('确认删除知识库「' + (kb.name || kb.id) + '」吗？此操作不可恢复。');
                         if (!ok) return;
@@ -1361,6 +1595,13 @@ async def chat_ui() -> str:
                             if (selectedKbId === kb.id) {
                                 selectedKbId = null;
                                 localStorage.removeItem(KB_SELECTED_KEY);
+                            }
+                            if (kbDetailOpenForId === kb.id) {
+                                kbDetailOpenForId = null;
+                                if (kbLinkedPanel) {
+                                    kbLinkedPanel.classList.remove('open');
+                                    kbLinkedPanel.setAttribute('aria-hidden', 'true');
+                                }
                             }
                             await refreshKbListAndRender();
                             setStatus('已删除知识库：' + (kb.name || kb.id));
@@ -1378,10 +1619,110 @@ async def chat_ui() -> str:
             }
         }
 
+        async function fetchKbFiles(kbId) {
+            const resp = await fetch(apiUrl('/api/kb/' + encodeURIComponent(kbId) + '/files'));
+            const data = await resp.json().catch(function () { return {}; });
+            if (!resp.ok) throw new Error((data && data.detail) ? data.detail : ('HTTP ' + resp.status));
+            return Array.isArray(data.items) ? data.items : [];
+        }
+
+        function _fmtSize(n) {
+            var b = Number(n || 0);
+            if (b < 1024) return b + ' B';
+            if (b < 1024 * 1024) return (b / 1024).toFixed(1) + ' KB';
+            return (b / 1024 / 1024).toFixed(1) + ' MB';
+        }
+
+        async function openKbLinkedPanel(kb) {
+            if (!kbLinkedPanel || !kbLinkedHead || !kbLinkedList) return;
+            kbLinkedHead.textContent = (kb.name || kb.id) + ' · 文件';
+            kbLinkedList.innerHTML = '<div class="history-empty">加载中…</div>';
+            kbLinkedPanel.classList.add('open');
+            kbLinkedPanel.setAttribute('aria-hidden', 'false');
+
+            try {
+                const files = await fetchKbFiles(kb.id);
+                kbLinkedList.innerHTML = '';
+                if (!files.length) {
+                    var empty = document.createElement('div');
+                    empty.className = 'history-empty';
+                    empty.textContent = kb.id === 'legacy_fire' ? '默认“消防”不展示原始文件列表' : '该知识库暂无文件';
+                    kbLinkedList.appendChild(empty);
+                    return;
+                }
+                for (var i = 0; i < files.length; i++) {
+                    (function (f) {
+                        var row = document.createElement('div');
+                        row.className = 'kb-file-row';
+
+                        var top = document.createElement('div');
+                        top.className = 'kb-file-row-top';
+
+                        var left = document.createElement('div');
+                        var n = document.createElement('div');
+                        n.className = 'kb-file-name';
+                        var rawName = f.name || f.rel_path || '未命名文件';
+                        n.textContent = String(rawName).replace(/^[0-9a-f]{12}_/i, '');
+                        var m = document.createElement('div');
+                        m.className = 'kb-file-meta';
+                        m.textContent = '大小：' + _fmtSize(f.size || 0);
+                        left.appendChild(n);
+                        left.appendChild(m);
+
+                        var del = document.createElement('button');
+                        del.type = 'button';
+                        del.className = 'kb-file-del';
+                        del.textContent = '×';
+                        del.title = '删除文件';
+                        del.disabled = kb.id === 'legacy_fire';
+                        del.addEventListener('click', async function () {
+                            var ok = window.confirm('确认删除文件：' + (f.rel_path || f.name) + ' ？');
+                            if (!ok) return;
+                            try {
+                                const resp = await fetch(apiUrl('/api/kb/' + encodeURIComponent(kb.id) + '/file?rel_path=' + encodeURIComponent(f.rel_path || f.name)), { method: 'DELETE' });
+                                const data = await resp.json().catch(function () { return {}; });
+                                if (!resp.ok) throw new Error((data && data.detail) ? data.detail : ('HTTP ' + resp.status));
+                                setStatus('文件已删除，正在重建索引…');
+                                await waitKbRebuildProgress(kb.id);
+                                await refreshKbListAndRender();
+                                await openKbLinkedPanel(kb);
+                                setStatus('删除完成并已重建索引');
+                            } catch (err) {
+                                setStatus('删除失败：' + (err.message || err));
+                            }
+                        });
+
+                        top.appendChild(left);
+                        top.appendChild(del);
+                        row.appendChild(top);
+                        kbLinkedList.appendChild(row);
+                    })(files[i]);
+                }
+            } catch (err) {
+                kbLinkedList.innerHTML = '<div class="history-empty">加载失败：' + (err.message || err) + '</div>';
+            }
+        }
+
         async function refreshKbListAndRender() {
             try {
                 await fetchKbList();
                 renderKbList();
+                if (kbDetailOpenForId) {
+                    var target = null;
+                    for (var i = 0; i < kbItems.length; i++) {
+                        if (kbItems[i].id === kbDetailOpenForId) {
+                            target = kbItems[i];
+                            break;
+                        }
+                    }
+                    if (target) {
+                        await openKbLinkedPanel(target);
+                    } else if (kbLinkedPanel) {
+                        kbLinkedPanel.classList.remove('open');
+                        kbLinkedPanel.setAttribute('aria-hidden', 'true');
+                        kbDetailOpenForId = null;
+                    }
+                }
             } catch (err) {
                 setStatus(err.message || String(err));
             }
@@ -1391,6 +1732,7 @@ async def chat_ui() -> str:
             renderHistoryList();
             refreshKbListAndRender();
             setDrawerTab('history');
+            kbDetailOpenForId = null;
             if (historyOverlay) {
                 historyOverlay.classList.add('open');
                 historyOverlay.setAttribute('aria-hidden', 'false');
