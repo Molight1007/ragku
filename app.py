@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import secrets
 import shutil
 import threading
 import uuid
@@ -36,11 +37,15 @@ def _ensure_kb_root_dir() -> None:
 
 def _safe_kb_id(name: str) -> str:
     base = (name or "").strip()
-    safe = "".join(ch for ch in base if ch.isalnum() or ch in {"_", "-"})
-    safe = safe.strip("_-")
-    if not safe:
-        safe = f"kb_{uuid.uuid4().hex[:8]}"
-    return safe[:64]
+    if base == LEGACY_KB_ID:
+        return LEGACY_KB_ID
+    if base.isdigit():
+        return base
+    return ""
+
+
+def _new_kb_id() -> str:
+    return str(secrets.randbelow(10**12 - 10**11) + 10**11)
 
 
 def _kb_dir(kb_id: str) -> Path:
@@ -254,6 +259,7 @@ def _collect_documents_for_kb(data_dir: Path) -> List[tuple[str, str]]:
 KB_UPLOAD_PROGRESS: dict[str, dict] = {}
 KB_UPLOAD_LOCK = threading.Lock()
 KB_REBUILD_RUNNING: set[str] = set()
+KB_CANCEL_REBUILD: set[str] = set()
 
 
 def _build_embeddings_for_kb_with_progress(docs: List[tuple[str, str]], kb_id: str):
@@ -280,6 +286,11 @@ def _build_embeddings_for_kb_with_progress(docs: List[tuple[str, str]], kb_id: s
         }
 
     for idx, (source, text) in enumerate(docs, start=1):
+        with KB_UPLOAD_LOCK:
+            if kb_id in KB_CANCEL_REBUILD:
+                KB_UPLOAD_PROGRESS[kb_id]["done"] = True
+                KB_UPLOAD_PROGRESS[kb_id]["message"] = "重建已取消"
+                raise RuntimeError("重建已取消")
         try:
             resp = TextEmbedding.call(model=settings.embedding_model, input=text)
             status = getattr(resp, "status_code", None)
@@ -350,13 +361,12 @@ async def api_kb_list() -> KnowledgeBaseListResponse:
 async def api_kb_create(body: KnowledgeBaseCreateRequest) -> KnowledgeBaseInfo:
     _ensure_kb_root_dir()
     kb_name = (body.name or "").strip() or f"知识库-{uuid.uuid4().hex[:6]}"
-    kb_id = _safe_kb_id(kb_name)
-    base = _kb_dir(kb_id)
-    i = 2
-    while base.exists():
-        kb_id = _safe_kb_id(f"{kb_name}_{i}")
-        base = _kb_dir(kb_id)
-        i += 1
+
+    # 使用随机数字 ID，避免中文名称经 _safe_kb_id 过滤后变空导致死循环
+    kb_id = _new_kb_id()
+    while _kb_dir(kb_id).exists():
+        kb_id = _new_kb_id()
+
     _kb_files_dir(kb_id).mkdir(parents=True, exist_ok=True)
     _kb_name_file(kb_id).write_text(kb_name, encoding="utf-8")
     return KnowledgeBaseInfo(id=kb_id, name=kb_name, file_count=0)
@@ -385,7 +395,19 @@ async def api_kb_upload(kb_id: str = Form(...), file: UploadFile = File(...)) ->
 
     files_dir = _kb_files_dir(safe_id)
     files_dir.mkdir(parents=True, exist_ok=True)
-    stored = f"{uuid.uuid4().hex[:12]}_{safe_upload_name(file.filename)}"
+
+    incoming_name = safe_upload_name(file.filename)
+    incoming_cmp = incoming_name.lower()
+    for p in files_dir.rglob("*"):
+        if not p.is_file():
+            continue
+        exist_name = p.name
+        if len(exist_name) > 13 and exist_name[12] == "_":
+            exist_name = exist_name[13:]
+        if exist_name.lower() == incoming_cmp:
+            raise HTTPException(status_code=409, detail="已存在同名文件，不能重复上传")
+
+    stored = f"{uuid.uuid4().hex[:12]}_{incoming_name}"
     (files_dir / stored).write_bytes(data)
 
     with KB_UPLOAD_LOCK:
@@ -551,6 +573,11 @@ async def api_kb_delete_file(kb_id: str, rel_path: str) -> dict:
 async def api_kb_delete(kb_id: str) -> dict:
     safe_id = _safe_kb_id(kb_id)
 
+    with KB_UPLOAD_LOCK:
+        KB_CANCEL_REBUILD.add(safe_id)
+        KB_REBUILD_RUNNING.discard(safe_id)
+        KB_UPLOAD_PROGRESS.pop(safe_id, None)
+
     if safe_id == LEGACY_KB_ID:
         removed = False
         if settings.index_file.exists():
@@ -567,6 +594,9 @@ async def api_kb_delete(kb_id: str) -> dict:
     if not base.exists() or not base.is_dir():
         raise HTTPException(status_code=404, detail="知识库不存在")
 
+    for fp in (_kb_index_file(safe_id), _kb_meta_file(safe_id)):
+        if fp.exists():
+            fp.unlink()
     shutil.rmtree(base)
     return {"ok": True}
 
@@ -704,13 +734,13 @@ async def chat_ui() -> str:
         .kb-file-row {
             border: 1px solid #edf0f5;
             border-radius: 10px;
-            background: #ffffff;
+            background: linear-gradient(90deg, rgba(74,111,212,0.18) var(--fill, 0%), #ffffff var(--fill, 0%));
             padding: 8px;
             margin-bottom: 8px;
             transition: background 0.18s ease, border-color 0.18s ease;
         }
         .kb-file-row.selected {
-            background: #f6f9ff;
+            background: linear-gradient(90deg, rgba(74,111,212,0.22) var(--fill, 0%), #f6f9ff var(--fill, 0%));
             border-color: #c9d5fb;
         }
         .kb-file-row-top {
@@ -1415,6 +1445,7 @@ async def chat_ui() -> str:
         const STORAGE_KEY = 'ragku_chat_sessions_v1';
         const KB_SELECTED_KEY = 'ragku_selected_kb_id_v1';
         const KB_FILE_SELECTED_KEY = 'ragku_kb_file_selected_v1';
+        const KB_UPLOAD_TRACK_KEY = 'ragku_upload_tracking_kb_v1';
         let pendingAttachments = [];
         let chatInFlight = false;
         let chatAbortController = null;
@@ -1455,6 +1486,17 @@ async def chat_ui() -> str:
             var m = loadKbFileSelectionMap();
             m[kbId] = Array.isArray(arr) ? arr : [];
             saveKbFileSelectionMap(m);
+        }
+
+        function setKbFileRowProgress(kbId, percent, message) {
+            if (!kbLinkedPanel || !kbLinkedPanel.classList.contains('open')) return;
+            if (!kbDetailOpenForId || kbDetailOpenForId !== kbId) return;
+            var rows = kbLinkedList ? kbLinkedList.querySelectorAll('.kb-file-row') : [];
+            var p = Math.max(0, Math.min(100, Number(percent || 0)));
+            for (var i = 0; i < rows.length; i++) {
+                rows[i].style.setProperty('--fill', p + '%');
+                rows[i].setAttribute('title', message || ('分片进度 ' + p + '%'));
+            }
         }
 
         function apiUrl(path) {
@@ -2219,7 +2261,7 @@ async def chat_ui() -> str:
             }
         }
 
-        function resetChat() {
+        function resetChat(skipStatusReset) {
             if (chatInFlight && chatAbortController) {
                 chatCancelReason = 'reset';
                 try { chatAbortController.abort(); } catch (e) {}
@@ -2236,7 +2278,9 @@ async def chat_ui() -> str:
             hidePlusMenu();
             clearPendingAttachments();
             if (welcomeText) welcomeText.style.display = 'block';
-            setStatus('就绪');
+            if (!skipStatusReset) {
+                setStatus('就绪');
+            }
         }
 
         async function sendQuestion() {
@@ -2357,8 +2401,11 @@ async def chat_ui() -> str:
                         headers: { 'Content-Type': 'application/json' },
                         body: JSON.stringify({ name: name })
                     });
-                    const data = await resp.json();
-                    if (!resp.ok) throw new Error((data && data.detail) ? data.detail : ('HTTP ' + resp.status));
+                    const data = await resp.json().catch(function () { return null; });
+                    if (!resp.ok) {
+                        if (data && data.detail) throw new Error(data.detail);
+                        throw new Error('创建失败（HTTP ' + resp.status + '），请查看后端日志');
+                    }
                     if (kbNameInput) kbNameInput.value = '';
                     selectedKbId = data.id;
                     localStorage.setItem(KB_SELECTED_KEY, selectedKbId);
@@ -2407,7 +2454,28 @@ async def chat_ui() -> str:
             });
         }
 
-        async function waitKbRebuildProgress(kbId) {
+        function saveUploadTracking(kbId) {
+            try { localStorage.setItem(KB_UPLOAD_TRACK_KEY, JSON.stringify({ kb_id: kbId, ts: Date.now() })); } catch (e) {}
+        }
+
+        function clearUploadTracking() {
+            try { localStorage.removeItem(KB_UPLOAD_TRACK_KEY); } catch (e) {}
+        }
+
+        function loadUploadTracking() {
+            try {
+                var raw = localStorage.getItem(KB_UPLOAD_TRACK_KEY);
+                if (!raw) return null;
+                var o = JSON.parse(raw);
+                if (!o || !o.kb_id) return null;
+                return o;
+            } catch (e) {
+                return null;
+            }
+        }
+
+        async function waitKbRebuildProgress(kbId, persistTracking) {
+            if (persistTracking) saveUploadTracking(kbId);
             var maxLoop = 360;
             for (var i = 0; i < maxLoop; i++) {
                 let resp;
@@ -2431,19 +2499,39 @@ async def chat_ui() -> str:
                 if (total > 0) {
                     var p = Math.max(0, Math.min(100, Math.round(done * 100 / total)));
                     setStatus('分片处理中：' + done + '/' + total + '（' + p + '%）' + (msg ? ' - ' + msg : ''));
+                    setKbFileRowProgress(kbId, p, msg);
                 } else {
                     setStatus(msg || '分片处理中…');
+                    setKbFileRowProgress(kbId, 0, msg);
                 }
 
                 if (data.done) {
                     if (msg && msg.indexOf('失败') >= 0) {
+                        setKbFileRowProgress(kbId, 0, msg);
+                        clearUploadTracking();
                         throw new Error(msg);
                     }
+                    setKbFileRowProgress(kbId, 100, msg || '完成');
+                    clearUploadTracking();
                     return;
                 }
                 await new Promise(function (r) { setTimeout(r, 700); });
             }
+            clearUploadTracking();
             throw new Error('等待分片进度超时');
+        }
+
+        async function resumeUploadProgressIfNeeded() {
+            var t = loadUploadTracking();
+            if (!t || !t.kb_id) return;
+            setStatus('检测到上次有进行中的索引任务，正在恢复进度…');
+            try {
+                await waitKbRebuildProgress(t.kb_id, false);
+                setStatus('索引任务已完成');
+                setTimeout(function () { setStatus('就绪'); }, 900);
+            } catch (err) {
+                setStatus('恢复进度失败：' + (err.message || err));
+            }
         }
 
         if (kbFileInput) {
@@ -2467,7 +2555,7 @@ async def chat_ui() -> str:
                         var data = await uploadKbFileWithProgress(kbUploadTargetId, f, idx, total);
                         lastData = data;
                         ok++;
-                        await waitKbRebuildProgress(kbUploadTargetId);
+                        await waitKbRebuildProgress(kbUploadTargetId, true);
                     }
 
                     if (lastData && lastData.id) {
@@ -2601,8 +2689,9 @@ async def chat_ui() -> str:
             if (ok > 0) setStatus('已导入 ' + ok + ' 个文件');
         });
 
-        resetChat();
+        resetChat(!!loadUploadTracking());
         autoResizeInput();
+        resumeUploadProgressIfNeeded();
     </script>
 </body>
 </html>
