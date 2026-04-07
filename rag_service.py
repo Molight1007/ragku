@@ -144,6 +144,44 @@ def generate_answer(prompt: str) -> str:
     return output
 
 
+def _filter_index_by_files(
+    embeddings: np.ndarray,
+    metadatas: List[dict],
+    selected_files: List[str],
+) -> Tuple[np.ndarray, List[dict]]:
+    wanted = {str(x).strip() for x in selected_files if str(x).strip()}
+    if not wanted:
+        return embeddings, metadatas
+
+    kept_vecs: List[np.ndarray] = []
+    kept_meta: List[dict] = []
+    for i, m in enumerate(metadatas):
+        src = str(m.get("source", "") or "")
+        src_name = Path(src).name
+        src_clean = src_name
+        if len(src_clean) > 13 and src_clean[12] == "_":
+            src_clean = src_clean[13:]
+        if src_name in wanted or src_clean in wanted:
+            kept_vecs.append(embeddings[i])
+            kept_meta.append(m)
+
+    if not kept_vecs:
+        return np.zeros((0, embeddings.shape[1]), dtype=embeddings.dtype), []
+    return np.stack(kept_vecs), kept_meta
+
+
+def rag_answer_filtered(query: str, kb_id: str, selected_files: List[str]) -> Tuple[str, List[dict]]:
+    embeddings, metadatas = load_index(kb_id=kb_id)
+    f_embeddings, f_meta = _filter_index_by_files(embeddings, metadatas, selected_files)
+    if f_embeddings.shape[0] == 0:
+        raise FileNotFoundError("当前所选文件没有可检索内容，请取消筛选或重新选择文件。")
+    q_embed = embed_query(query)
+    contexts = search_similar_chunks(q_embed, f_embeddings, f_meta, settings.top_k)
+    prompt = build_prompt(query, contexts)
+    answer = generate_answer(prompt)
+    return answer, contexts
+
+
 def rag_answer(query: str, kb_id: str | None = None) -> Tuple[str, List[dict]]:
     """对外暴露的 RAG 主流程。"""
     embeddings, metadatas = load_index(kb_id=kb_id)

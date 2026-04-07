@@ -17,7 +17,7 @@ import numpy as np
 from pydantic import BaseModel
 
 from config import settings
-from rag_service import rag_answer
+from rag_service import rag_answer, rag_answer_filtered
 
 MAX_UPLOAD_BYTES = 15 * 1024 * 1024
 LEGACY_KB_ID = "legacy_fire"
@@ -80,6 +80,7 @@ class ChatRequest(BaseModel):
     question: str = ""
     attachment_text: str = ""
     kb_id: Optional[str] = None
+    selected_files: Optional[List[str]] = None
 
 
 class ContextSnippet(BaseModel):
@@ -675,8 +676,14 @@ async def chat_ui() -> str:
             pointer-events: auto;
         }
         .kb-linked-head {
-            padding: 18px 16px 12px;
+            padding: 12px 20px 10px 12px;
             border-bottom: 1px solid #eef0f5;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 8px;
+        }
+        .kb-linked-title {
             font-size: 16px;
             font-weight: 700;
         }
@@ -689,9 +696,14 @@ async def chat_ui() -> str:
         .kb-file-row {
             border: 1px solid #edf0f5;
             border-radius: 10px;
-            background: #fafbff;
+            background: #ffffff;
             padding: 8px;
             margin-bottom: 8px;
+            transition: background 0.18s ease, border-color 0.18s ease;
+        }
+        .kb-file-row.selected {
+            background: #f6f9ff;
+            border-color: #c9d5fb;
         }
         .kb-file-row-top {
             display: flex;
@@ -708,7 +720,7 @@ async def chat_ui() -> str:
             background: #fff;
             font-size: 18px;
             line-height: 1;
-            color: #9ca3af;
+            color: #1f2330;
             cursor: pointer;
             transition: background 0.15s ease, color 0.15s ease, border-color 0.15s ease;
         }
@@ -722,6 +734,36 @@ async def chat_ui() -> str:
             color: #c4c7cf;
             background: #f6f7fa;
             border-color: #e5e7eb;
+        }
+        .kb-file-pick {
+            width: 28px;
+            height: 28px;
+            padding: 0;
+            border: 1px solid #c7cbd6;
+            border-radius: 8px;
+            background: #fff;
+            color: #111827;
+            font-size: 15px;
+            font-weight: 500;
+            line-height: 1;
+            cursor: pointer;
+            transition: transform 0.18s ease, background 0.18s ease, border-color 0.18s ease, color 0.18s ease;
+        }
+        .kb-file-pick:hover {
+            border-color: #8eaefb;
+        }
+        .kb-file-pick.selected {
+            background: #4a6fd4;
+            border-color: #4a6fd4;
+            color: #fff;
+            transform: scale(1.08);
+        }
+        .kb-file-actions {
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            margin-left: 8px;
+            flex-shrink: 0;
         }
         .kb-file-name {
             font-size: 11px;
@@ -851,7 +893,7 @@ async def chat_ui() -> str:
             border-radius: 8px;
             font-size: 18px;
             line-height: 1;
-            color: #9ca3af;
+            color: #1f2330;
             transition: background 0.15s ease, color 0.15s ease, border-color 0.15s ease;
         }
         .kb-delete-x:hover {
@@ -861,9 +903,10 @@ async def chat_ui() -> str:
         }
         .kb-delete-x:disabled {
             cursor: not-allowed;
-            color: #c4c7cf;
-            background: #f6f7fa;
-            border-color: #e5e7eb;
+            color: #9ca3af;
+            background: #fff;
+            border-color: #d9dbe2;
+            opacity: 1;
         }
         .history-row {
             display: flex;
@@ -899,12 +942,15 @@ async def chat_ui() -> str:
             width: 44px;
             border: none;
             background: transparent;
-            color: #9ca3af;
+            color: #1f2330;
             font-size: 20px;
             line-height: 1;
             cursor: pointer;
             padding: 0;
             font-family: inherit;
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
             transition: background 0.15s ease, color 0.15s ease;
         }
         .history-item-delete:hover {
@@ -1315,7 +1361,10 @@ async def chat_ui() -> str:
         </div>
     </aside>
     <aside id="kbLinkedPanel" class="kb-linked-panel" aria-hidden="true">
-        <div id="kbLinkedHead" class="kb-linked-head">知识库文件</div>
+        <div id="kbLinkedHead" class="kb-linked-head">
+            <span id="kbLinkedTitle" class="kb-linked-title">知识库文件</span>
+            <button id="kbPickAllBtn" type="button" class="kb-file-pick" title="全选文件">✓</button>
+        </div>
         <div id="kbLinkedList" class="kb-linked-list"></div>
     </aside>
     <input type="file" id="kbFileInput" accept=".txt,.md,.pdf,.docx,.jpg,.jpeg,.png,.bmp,.webp,.gif" multiple style="display:none" />
@@ -1351,10 +1400,13 @@ async def chat_ui() -> str:
         const kbFileInput = document.getElementById('kbFileInput');
         const kbLinkedPanel = document.getElementById('kbLinkedPanel');
         const kbLinkedHead = document.getElementById('kbLinkedHead');
+        const kbLinkedTitle = document.getElementById('kbLinkedTitle');
+        const kbPickAllBtn = document.getElementById('kbPickAllBtn');
         const kbLinkedList = document.getElementById('kbLinkedList');
 
         const STORAGE_KEY = 'ragku_chat_sessions_v1';
         const KB_SELECTED_KEY = 'ragku_selected_kb_id_v1';
+        const KB_FILE_SELECTED_KEY = 'ragku_kb_file_selected_v1';
         let pendingAttachments = [];
         let chatInFlight = false;
         let chatAbortController = null;
@@ -1366,6 +1418,32 @@ async def chat_ui() -> str:
         let selectedKbId = localStorage.getItem(KB_SELECTED_KEY) || null;
         let kbUploadTargetId = null;
         let kbDetailOpenForId = null;
+
+        function loadKbFileSelectionMap() {
+            try {
+                var raw = localStorage.getItem(KB_FILE_SELECTED_KEY);
+                var obj = raw ? JSON.parse(raw) : {};
+                return (obj && typeof obj === 'object') ? obj : {};
+            } catch (e) {
+                return {};
+            }
+        }
+
+        function saveKbFileSelectionMap(mapObj) {
+            try { localStorage.setItem(KB_FILE_SELECTED_KEY, JSON.stringify(mapObj || {})); } catch (e) {}
+        }
+
+        function getSelectedFilesForKb(kbId) {
+            var m = loadKbFileSelectionMap();
+            var arr = m[kbId];
+            return Array.isArray(arr) ? arr : [];
+        }
+
+        function setSelectedFilesForKb(kbId, arr) {
+            var m = loadKbFileSelectionMap();
+            m[kbId] = Array.isArray(arr) ? arr : [];
+            saveKbFileSelectionMap(m);
+        }
 
         function apiUrl(path) {
             var base = (window.location.origin && window.location.origin !== 'null')
@@ -1583,7 +1661,7 @@ async def chat_ui() -> str:
                     deleteBtn.type = 'button';
                     deleteBtn.className = 'kb-delete-x';
                     deleteBtn.textContent = '×';
-                    deleteBtn.title = '删除知识库';
+                    deleteBtn.title = kb.id === 'legacy_fire' ? '默认知识库不可删除' : '删除知识库';
                     deleteBtn.disabled = kb.id === 'legacy_fire';
                     deleteBtn.addEventListener('click', async function () {
                         var ok = window.confirm('确认删除知识库「' + (kb.name || kb.id) + '」吗？此操作不可恢复。');
@@ -1634,8 +1712,8 @@ async def chat_ui() -> str:
         }
 
         async function openKbLinkedPanel(kb) {
-            if (!kbLinkedPanel || !kbLinkedHead || !kbLinkedList) return;
-            kbLinkedHead.textContent = (kb.name || kb.id) + ' · 文件';
+            if (!kbLinkedPanel || !kbLinkedList) return;
+            if (kbLinkedTitle) kbLinkedTitle.textContent = (kb.name || kb.id) + ' · 文件';
             kbLinkedList.innerHTML = '<div class="history-empty">加载中…</div>';
             kbLinkedPanel.classList.add('open');
             kbLinkedPanel.setAttribute('aria-hidden', 'false');
@@ -1643,6 +1721,28 @@ async def chat_ui() -> str:
             try {
                 const files = await fetchKbFiles(kb.id);
                 kbLinkedList.innerHTML = '';
+
+                var selectedAllNow = getSelectedFilesForKb(kb.id);
+                var allKeys = files.map(function (f) {
+                    return String((f.name || '').replace(/^[0-9a-f]{12}_/i, ''));
+                });
+                var allPicked = allKeys.length > 0 && allKeys.every(function (k) { return selectedAllNow.indexOf(k) >= 0; });
+
+                if (kbPickAllBtn) {
+                    kbPickAllBtn.classList.toggle('selected', allPicked);
+                    kbPickAllBtn.textContent = '✓';
+                    kbPickAllBtn.onclick = function () {
+                        var cur = getSelectedFilesForKb(kb.id);
+                        var curAll = allKeys.length > 0 && allKeys.every(function (k) { return cur.indexOf(k) >= 0; });
+                        if (curAll) {
+                            setSelectedFilesForKb(kb.id, []);
+                        } else {
+                            setSelectedFilesForKb(kb.id, allKeys.slice());
+                        }
+                        openKbLinkedPanel(kb);
+                    };
+                }
+
                 if (!files.length) {
                     var empty = document.createElement('div');
                     empty.className = 'history-empty';
@@ -1669,6 +1769,35 @@ async def chat_ui() -> str:
                         left.appendChild(n);
                         left.appendChild(m);
 
+                        var pick = document.createElement('button');
+                        pick.type = 'button';
+                        pick.className = 'kb-file-pick';
+                        pick.title = '选择文件';
+                        pick.textContent = '✓';
+
+                        var fileKey = (f.name || '').replace(/^[0-9a-f]{12}_/i, '');
+                        var selectedFiles = getSelectedFilesForKb(kb.id);
+                        var isPicked = selectedFiles.indexOf(fileKey) >= 0;
+                        pick.classList.toggle('selected', isPicked);
+                        row.classList.toggle('selected', isPicked);
+
+                        pick.addEventListener('click', function () {
+                            var cur = getSelectedFilesForKb(kb.id);
+                            var idx = cur.indexOf(fileKey);
+                            if (idx >= 0) {
+                                cur.splice(idx, 1);
+                            } else {
+                                cur.push(fileKey);
+                            }
+                            setSelectedFilesForKb(kb.id, cur);
+                            var nowPicked = cur.indexOf(fileKey) >= 0;
+                            pick.classList.toggle('selected', nowPicked);
+                            row.classList.toggle('selected', nowPicked);
+                            var allNow = allKeys.length > 0 && allKeys.every(function (k) { return cur.indexOf(k) >= 0; });
+                            if (kbPickAllBtn) kbPickAllBtn.classList.toggle('selected', allNow);
+                            setStatus('已更新检索文件选择：' + cur.length + ' 个');
+                        });
+
                         var del = document.createElement('button');
                         del.type = 'button';
                         del.className = 'kb-file-del';
@@ -1684,6 +1813,8 @@ async def chat_ui() -> str:
                                 if (!resp.ok) throw new Error((data && data.detail) ? data.detail : ('HTTP ' + resp.status));
                                 setStatus('文件已删除，正在重建索引…');
                                 await waitKbRebuildProgress(kb.id);
+                                var cur = getSelectedFilesForKb(kb.id).filter(function (x) { return x !== fileKey; });
+                                setSelectedFilesForKb(kb.id, cur);
                                 await refreshKbListAndRender();
                                 await openKbLinkedPanel(kb);
                                 setStatus('删除完成并已重建索引');
@@ -1692,8 +1823,13 @@ async def chat_ui() -> str:
                             }
                         });
 
+                        var actions = document.createElement('div');
+                        actions.className = 'kb-file-actions';
+                        actions.appendChild(del);
+                        actions.appendChild(pick);
+
                         top.appendChild(left);
-                        top.appendChild(del);
+                        top.appendChild(actions);
                         row.appendChild(top);
                         kbLinkedList.appendChild(row);
                     })(files[i]);
@@ -1773,7 +1909,6 @@ async def chat_ui() -> str:
                     delBtn.setAttribute('aria-label', '删除此对话');
                     delBtn.title = '删除';
                     delBtn.textContent = '×';
-                    delBtn.classList.add('kb-delete-x');
                     delBtn.addEventListener('click', function (e) {
                         e.preventDefault();
                         e.stopPropagation();
@@ -2126,7 +2261,12 @@ async def chat_ui() -> str:
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json' },
                         signal: chatAbortController.signal,
-                        body: JSON.stringify({ question: q, attachment_text: attachPayload, kb_id: selectedKbId })
+                        body: JSON.stringify({
+                            question: q,
+                            attachment_text: attachPayload,
+                            kb_id: selectedKbId,
+                            selected_files: selectedKbId ? getSelectedFilesForKb(selectedKbId) : []
+                        })
                     });
                 } catch (err) {
                     if (err && err.name === 'AbortError') {
@@ -2469,10 +2609,19 @@ async def chat(body: ChatRequest) -> ChatResponse:
         return ChatResponse(answer="请输入问题，或先上传文件完成识别后再发送。", contexts=[])
 
     try:
-        answer, contexts_raw = rag_answer(
-            _effective_rag_query(q, a),
-            kb_id=_resolve_rag_kb_id(body.kb_id),
-        )
+        selected_files = [str(x) for x in (body.selected_files or []) if str(x).strip()]
+        resolved_kb = _resolve_rag_kb_id(body.kb_id)
+        if selected_files and resolved_kb:
+            answer, contexts_raw = rag_answer_filtered(
+                _effective_rag_query(q, a),
+                kb_id=resolved_kb,
+                selected_files=selected_files,
+            )
+        else:
+            answer, contexts_raw = rag_answer(
+                _effective_rag_query(q, a),
+                kb_id=resolved_kb,
+            )
     except FileNotFoundError as e:
         raise HTTPException(status_code=404, detail=str(e)) from e
 
