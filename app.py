@@ -2,21 +2,56 @@ from __future__ import annotations
 
 import uuid
 from pathlib import Path
-from typing import List
+from typing import List, Optional
 
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
+import numpy as np
 from pydantic import BaseModel
 
 from rag_service import rag_answer
 
 MAX_UPLOAD_BYTES = 15 * 1024 * 1024
 UPLOAD_DIR = Path(__file__).resolve().parent / "uploads"
+KB_ROOT_DIR = UPLOAD_DIR / "knowledge_bases"
 
 
 def _ensure_upload_dir() -> None:
     UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def _ensure_kb_root_dir() -> None:
+    KB_ROOT_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def _safe_kb_id(name: str) -> str:
+    base = (name or "").strip()
+    safe = "".join(ch for ch in base if ch.isalnum() or ch in {"_", "-"})
+    safe = safe.strip("_-")
+    if not safe:
+        safe = f"kb_{uuid.uuid4().hex[:8]}"
+    return safe[:64]
+
+
+def _kb_dir(kb_id: str) -> Path:
+    return KB_ROOT_DIR / kb_id
+
+
+def _kb_files_dir(kb_id: str) -> Path:
+    return _kb_dir(kb_id) / "files"
+
+
+def _kb_index_file(kb_id: str) -> Path:
+    return _kb_dir(kb_id) / "index_store.npy"
+
+
+def _kb_meta_file(kb_id: str) -> Path:
+    return _kb_dir(kb_id) / "index_meta.npy"
+
+
+def _kb_name_file(kb_id: str) -> Path:
+    return _kb_dir(kb_id) / "name.txt"
 
 
 class ChatRequest(BaseModel):
@@ -24,6 +59,7 @@ class ChatRequest(BaseModel):
 
     question: str = ""
     attachment_text: str = ""
+    kb_id: Optional[str] = None
 
 
 class ContextSnippet(BaseModel):
@@ -54,6 +90,26 @@ class UploadExtractResponse(BaseModel):
     text: str
     filename: str
     saved_path: str
+
+
+class KnowledgeBaseCreateRequest(BaseModel):
+    """创建知识库请求。"""
+
+    name: str = ""
+
+
+class KnowledgeBaseInfo(BaseModel):
+    """知识库信息。"""
+
+    id: str
+    name: str
+    file_count: int
+
+
+class KnowledgeBaseListResponse(BaseModel):
+    """知识库列表返回。"""
+
+    items: List[KnowledgeBaseInfo]
 
 
 app = FastAPI(
@@ -146,6 +202,95 @@ async def api_upload_file(file: UploadFile = File(...)) -> UploadExtractResponse
         filename=file.filename,
         saved_path=rel,
     )
+
+
+def _collect_documents_for_kb(data_dir: Path) -> List[tuple[str, str]]:
+    from ingest import collect_documents
+
+    return collect_documents(data_dir)
+
+
+def _build_embeddings_for_kb(docs: List[tuple[str, str]]):
+    from ingest import build_embeddings
+
+    return build_embeddings(docs)
+
+
+def _list_kb_items() -> List[KnowledgeBaseInfo]:
+    _ensure_kb_root_dir()
+    items: List[KnowledgeBaseInfo] = []
+    for p in KB_ROOT_DIR.iterdir():
+        if not p.is_dir():
+            continue
+        kb_id = p.name
+        name_file = _kb_name_file(kb_id)
+        kb_name = name_file.read_text(encoding="utf-8", errors="ignore").strip() if name_file.exists() else kb_id
+        files_dir = _kb_files_dir(kb_id)
+        file_count = 0
+        if files_dir.exists():
+            file_count = len([x for x in files_dir.rglob("*") if x.is_file()])
+        items.append(KnowledgeBaseInfo(id=kb_id, name=kb_name or kb_id, file_count=file_count))
+    items.sort(key=lambda x: x.name)
+    return items
+
+
+@app.get("/api/kb/list", response_model=KnowledgeBaseListResponse)
+async def api_kb_list() -> KnowledgeBaseListResponse:
+    return KnowledgeBaseListResponse(items=_list_kb_items())
+
+
+@app.post("/api/kb/create", response_model=KnowledgeBaseInfo)
+async def api_kb_create(body: KnowledgeBaseCreateRequest) -> KnowledgeBaseInfo:
+    _ensure_kb_root_dir()
+    kb_name = (body.name or "").strip() or f"知识库-{uuid.uuid4().hex[:6]}"
+    kb_id = _safe_kb_id(kb_name)
+    base = _kb_dir(kb_id)
+    i = 2
+    while base.exists():
+        kb_id = _safe_kb_id(f"{kb_name}_{i}")
+        base = _kb_dir(kb_id)
+        i += 1
+    _kb_files_dir(kb_id).mkdir(parents=True, exist_ok=True)
+    _kb_name_file(kb_id).write_text(kb_name, encoding="utf-8")
+    return KnowledgeBaseInfo(id=kb_id, name=kb_name, file_count=0)
+
+
+@app.post("/api/kb/upload", response_model=KnowledgeBaseInfo)
+async def api_kb_upload(kb_id: str = Form(...), file: UploadFile = File(...)) -> KnowledgeBaseInfo:
+    from config import settings as app_settings
+    from document_extract import is_allowed_upload, is_image_filename, safe_upload_name
+
+    safe_id = _safe_kb_id(kb_id)
+    base = _kb_dir(safe_id)
+    if not base.exists():
+        raise HTTPException(status_code=404, detail="知识库不存在，请先创建")
+
+    if not file.filename:
+        raise HTTPException(status_code=400, detail="缺少文件名")
+    if not is_allowed_upload(file.filename):
+        raise HTTPException(status_code=400, detail="仅支持 txt、md、pdf、docx 及常见图片格式")
+
+    data = await file.read()
+    if len(data) > MAX_UPLOAD_BYTES:
+        raise HTTPException(status_code=413, detail="文件过大")
+    if is_image_filename(file.filename) and not app_settings.dashscope_api_key:
+        raise HTTPException(status_code=400, detail="未配置 DASHSCOPE_API_KEY，无法对图片调用百炼识别")
+
+    files_dir = _kb_files_dir(safe_id)
+    files_dir.mkdir(parents=True, exist_ok=True)
+    stored = f"{uuid.uuid4().hex[:12]}_{safe_upload_name(file.filename)}"
+    (files_dir / stored).write_bytes(data)
+
+    docs = _collect_documents_for_kb(files_dir)
+    if not docs:
+        raise HTTPException(status_code=422, detail="知识库未提取到可向量化文本")
+    embeddings, metadatas = _build_embeddings_for_kb(docs)
+    np.save(_kb_index_file(safe_id), embeddings)
+    np.save(_kb_meta_file(safe_id), np.array(metadatas, dtype=object))
+
+    kb_name = _kb_name_file(safe_id).read_text(encoding="utf-8", errors="ignore").strip() or safe_id
+    file_count = len([x for x in files_dir.rglob("*") if x.is_file()])
+    return KnowledgeBaseInfo(id=safe_id, name=kb_name, file_count=file_count)
 
 
 @app.get("/chat-ui", response_class=HTMLResponse)
@@ -250,13 +395,105 @@ async def chat_ui() -> str:
             font-size: 17px;
             font-weight: 700;
             color: #1f2330;
-            padding: 0 20px 16px;
+            padding: 0 20px 12px;
             border-bottom: 1px solid #eef0f5;
+        }
+        .drawer-tabs {
+            display: flex;
+            gap: 8px;
+            padding: 10px 16px 8px;
+            border-bottom: 1px solid #eef0f5;
+        }
+        .drawer-tab {
+            border: 1px solid #d9dbe2;
+            background: #fff;
+            color: #4a4f5d;
+            border-radius: 999px;
+            font-size: 13px;
+            padding: 6px 12px;
+            cursor: pointer;
+        }
+        .drawer-tab.active {
+            background: #e8edfb;
+            color: #355ddf;
+            border-color: #c9d5fb;
+        }
+        .drawer-panel {
+            display: none;
+            flex: 1;
+            min-height: 0;
+            overflow-y: auto;
+        }
+        .drawer-panel.active {
+            display: block;
         }
         .history-list {
             flex: 1;
             overflow-y: auto;
             padding: 12px 0 8px;
+        }
+        .kb-panel {
+            padding: 12px 16px 14px;
+        }
+        .kb-create {
+            display: flex;
+            gap: 8px;
+            margin-bottom: 12px;
+        }
+        .kb-create input {
+            flex: 1;
+            min-width: 0;
+            border: 1px solid #d9dbe2;
+            border-radius: 10px;
+            padding: 8px 10px;
+            font-size: 14px;
+        }
+        .kb-create button {
+            border: 1px solid #d9dbe2;
+            border-radius: 10px;
+            background: #fff;
+            padding: 8px 10px;
+            cursor: pointer;
+        }
+        .kb-item {
+            border: 1px solid #edf0f5;
+            border-radius: 10px;
+            background: #fff;
+            padding: 10px;
+            margin-bottom: 10px;
+        }
+        .kb-item.active {
+            border-color: #c9d5fb;
+            background: #f6f9ff;
+        }
+        .kb-head {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            gap: 8px;
+            margin-bottom: 8px;
+        }
+        .kb-name {
+            font-size: 14px;
+            font-weight: 600;
+            color: #1f2330;
+            word-break: break-all;
+        }
+        .kb-meta {
+            font-size: 12px;
+            color: #6b7280;
+        }
+        .kb-actions {
+            display: flex;
+            gap: 8px;
+        }
+        .kb-actions button {
+            border: 1px solid #d9dbe2;
+            border-radius: 8px;
+            background: #fff;
+            font-size: 12px;
+            padding: 6px 8px;
+            cursor: pointer;
         }
         .history-row {
             display: flex;
@@ -651,7 +888,7 @@ async def chat_ui() -> str:
 <body>
     <div class="page">
         <div class="top-tools">
-            <button type="button" id="menuBtn" class="menu-btn" aria-label="打开历史对话" title="历史对话">
+            <button type="button" id="menuBtn" class="menu-btn" aria-label="打开菜单" title="菜单">
                 <span class="bar"></span>
                 <span class="bar"></span>
                 <span class="bar"></span>
@@ -682,12 +919,28 @@ async def chat_ui() -> str:
         </div>
     </div>
     <div id="historyOverlay" class="history-overlay" aria-hidden="true"></div>
-    <aside id="historyDrawer" class="history-drawer" aria-hidden="true" aria-label="历史对话">
+    <aside id="historyDrawer" class="history-drawer" aria-hidden="true" aria-label="菜单">
         <div class="history-drawer-inner">
-            <div class="history-drawer-title">历史对话</div>
-            <div id="historyList" class="history-list"></div>
+            <div class="history-drawer-title">菜单</div>
+            <div class="drawer-tabs">
+                <button type="button" id="tabHistory" class="drawer-tab active">历史记录</button>
+                <button type="button" id="tabKb" class="drawer-tab">知识库</button>
+            </div>
+            <div id="panelHistory" class="drawer-panel active">
+                <div id="historyList" class="history-list"></div>
+            </div>
+            <div id="panelKb" class="drawer-panel">
+                <div class="kb-panel">
+                    <div class="kb-create">
+                        <input id="kbNameInput" type="text" placeholder="输入知识库名称" />
+                        <button id="kbCreateBtn" type="button">创建</button>
+                    </div>
+                    <div id="kbList"></div>
+                </div>
+            </div>
         </div>
     </aside>
+    <input type="file" id="kbFileInput" accept=".txt,.md,.pdf,.docx,.jpg,.jpeg,.png,.bmp,.webp,.gif" style="display:none" />
     <input type="file" id="fileCamera" accept="image/*" capture="environment" style="display:none" />
     <input type="file" id="fileImage" accept="image/*" multiple style="display:none" />
     <input type="file" id="fileDoc" accept=".txt,.md,.pdf,.docx,.jpg,.jpeg,.png,.bmp,.webp,.gif" multiple style="display:none" />
@@ -710,8 +963,17 @@ async def chat_ui() -> str:
         const historyOverlay = document.getElementById('historyOverlay');
         const historyDrawer = document.getElementById('historyDrawer');
         const historyList = document.getElementById('historyList');
+        const tabHistory = document.getElementById('tabHistory');
+        const tabKb = document.getElementById('tabKb');
+        const panelHistory = document.getElementById('panelHistory');
+        const panelKb = document.getElementById('panelKb');
+        const kbNameInput = document.getElementById('kbNameInput');
+        const kbCreateBtn = document.getElementById('kbCreateBtn');
+        const kbList = document.getElementById('kbList');
+        const kbFileInput = document.getElementById('kbFileInput');
 
         const STORAGE_KEY = 'ragku_chat_sessions_v1';
+        const KB_SELECTED_KEY = 'ragku_selected_kb_id_v1';
         let pendingAttachments = [];
         let chatInFlight = false;
         let chatAbortController = null;
@@ -719,6 +981,9 @@ async def chat_ui() -> str:
         let currentSessionId = null;
         let sessionMessages = [];
         let persistTimer = null;
+        let kbItems = [];
+        let selectedKbId = localStorage.getItem(KB_SELECTED_KEY) || null;
+        let kbUploadTargetId = null;
 
         function apiUrl(path) {
             var base = (window.location.origin && window.location.origin !== 'null')
@@ -825,8 +1090,104 @@ async def chat_ui() -> str:
             }
         }
 
+        function setDrawerTab(tab) {
+            var isHistory = tab !== 'kb';
+            if (tabHistory) tabHistory.classList.toggle('active', isHistory);
+            if (tabKb) tabKb.classList.toggle('active', !isHistory);
+            if (panelHistory) panelHistory.classList.toggle('active', isHistory);
+            if (panelKb) panelKb.classList.toggle('active', !isHistory);
+        }
+
+        async function fetchKbList() {
+            let resp;
+            try {
+                resp = await fetch(apiUrl('/api/kb/list'));
+            } catch (err) {
+                throw new Error(explainFetchError(err));
+            }
+            if (!resp.ok) {
+                throw new Error('加载知识库失败：' + resp.status);
+            }
+            const data = await resp.json();
+            kbItems = Array.isArray(data.items) ? data.items : [];
+            if (selectedKbId && !kbItems.some(function (x) { return x.id === selectedKbId; })) {
+                selectedKbId = null;
+                localStorage.removeItem(KB_SELECTED_KEY);
+            }
+        }
+
+        function renderKbList() {
+            if (!kbList) return;
+            kbList.innerHTML = '';
+            if (!kbItems.length) {
+                var empty = document.createElement('div');
+                empty.className = 'history-empty';
+                empty.textContent = '暂无知识库，请先创建';
+                kbList.appendChild(empty);
+                return;
+            }
+            for (var i = 0; i < kbItems.length; i++) {
+                (function (kb) {
+                    var item = document.createElement('div');
+                    item.className = 'kb-item' + (kb.id === selectedKbId ? ' active' : '');
+
+                    var head = document.createElement('div');
+                    head.className = 'kb-head';
+
+                    var nameWrap = document.createElement('div');
+                    var nm = document.createElement('div');
+                    nm.className = 'kb-name';
+                    nm.textContent = kb.name || kb.id;
+                    var meta = document.createElement('div');
+                    meta.className = 'kb-meta';
+                    meta.textContent = '文件数：' + (kb.file_count || 0);
+                    nameWrap.appendChild(nm);
+                    nameWrap.appendChild(meta);
+                    head.appendChild(nameWrap);
+                    item.appendChild(head);
+
+                    var actions = document.createElement('div');
+                    actions.className = 'kb-actions';
+
+                    var selectBtn = document.createElement('button');
+                    selectBtn.type = 'button';
+                    selectBtn.textContent = kb.id === selectedKbId ? '当前使用中' : '使用此库';
+                    selectBtn.addEventListener('click', function () {
+                        selectedKbId = kb.id;
+                        localStorage.setItem(KB_SELECTED_KEY, kb.id);
+                        renderKbList();
+                        setStatus('已切换知识库：' + (kb.name || kb.id));
+                    });
+
+                    var uploadBtn = document.createElement('button');
+                    uploadBtn.type = 'button';
+                    uploadBtn.textContent = '上传文件';
+                    uploadBtn.addEventListener('click', function () {
+                        kbUploadTargetId = kb.id;
+                        if (kbFileInput) kbFileInput.click();
+                    });
+
+                    actions.appendChild(selectBtn);
+                    actions.appendChild(uploadBtn);
+                    item.appendChild(actions);
+                    kbList.appendChild(item);
+                })(kbItems[i]);
+            }
+        }
+
+        async function refreshKbListAndRender() {
+            try {
+                await fetchKbList();
+                renderKbList();
+            } catch (err) {
+                setStatus(err.message || String(err));
+            }
+        }
+
         function openHistoryDrawer() {
             renderHistoryList();
+            refreshKbListAndRender();
+            setDrawerTab('history');
             if (historyOverlay) {
                 historyOverlay.classList.add('open');
                 historyOverlay.setAttribute('aria-hidden', 'false');
@@ -1219,7 +1580,7 @@ async def chat_ui() -> str:
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json' },
                         signal: chatAbortController.signal,
-                        body: JSON.stringify({ question: q, attachment_text: attachPayload })
+                        body: JSON.stringify({ question: q, attachment_text: attachPayload, kb_id: selectedKbId })
                     });
                 } catch (err) {
                     if (err && err.name === 'AbortError') {
@@ -1264,6 +1625,71 @@ async def chat_ui() -> str:
                 e.stopPropagation();
                 hidePlusMenu();
                 openHistoryDrawer();
+            });
+        }
+        if (tabHistory) {
+            tabHistory.addEventListener('click', function () {
+                setDrawerTab('history');
+            });
+        }
+        if (tabKb) {
+            tabKb.addEventListener('click', function () {
+                setDrawerTab('kb');
+                refreshKbListAndRender();
+            });
+        }
+        if (kbCreateBtn) {
+            kbCreateBtn.addEventListener('click', async function () {
+                var name = (kbNameInput && kbNameInput.value) ? kbNameInput.value.trim() : '';
+                if (!name) {
+                    setStatus('请输入知识库名称');
+                    return;
+                }
+                setStatus('创建知识库中…');
+                try {
+                    const resp = await fetch(apiUrl('/api/kb/create'), {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ name: name })
+                    });
+                    const data = await resp.json();
+                    if (!resp.ok) throw new Error((data && data.detail) ? data.detail : ('HTTP ' + resp.status));
+                    if (kbNameInput) kbNameInput.value = '';
+                    selectedKbId = data.id;
+                    localStorage.setItem(KB_SELECTED_KEY, selectedKbId);
+                    await refreshKbListAndRender();
+                    setStatus('知识库已创建：' + (data.name || data.id));
+                } catch (err) {
+                    setStatus('创建失败：' + (err.message || err));
+                }
+            });
+        }
+        if (kbFileInput) {
+            kbFileInput.addEventListener('change', async function (e) {
+                var f = e.target.files && e.target.files[0];
+                e.target.value = '';
+                if (!f) return;
+                if (!kbUploadTargetId) {
+                    setStatus('请先选择知识库再上传');
+                    return;
+                }
+                setStatus('正在上传并构建索引，请稍候…');
+                try {
+                    var fd = new FormData();
+                    fd.append('kb_id', kbUploadTargetId);
+                    fd.append('file', f, f.name);
+                    const resp = await fetch(apiUrl('/api/kb/upload'), { method: 'POST', body: fd });
+                    const data = await resp.json();
+                    if (!resp.ok) throw new Error((data && data.detail) ? data.detail : ('HTTP ' + resp.status));
+                    selectedKbId = data.id;
+                    localStorage.setItem(KB_SELECTED_KEY, selectedKbId);
+                    await refreshKbListAndRender();
+                    setStatus('已上传并更新知识库：' + (data.name || data.id));
+                } catch (err) {
+                    setStatus('知识库上传失败：' + (err.message || err));
+                } finally {
+                    kbUploadTargetId = null;
+                }
             });
         }
         if (historyOverlay) {
@@ -1409,7 +1835,10 @@ async def chat(body: ChatRequest) -> ChatResponse:
     if not q and not a:
         return ChatResponse(answer="请输入问题，或先上传文件完成识别后再发送。", contexts=[])
 
-    answer, contexts_raw = rag_answer(_effective_rag_query(q, a))
+    try:
+        answer, contexts_raw = rag_answer(_effective_rag_query(q, a), kb_id=(body.kb_id or None))
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e)) from e
 
     contexts: List[ContextSnippet] = []
     for c in contexts_raw:

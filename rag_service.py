@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+from pathlib import Path
 from typing import List, Tuple
 
 import numpy as np
@@ -9,13 +10,31 @@ from dashscope import Generation
 from config import settings
 
 
-def load_index() -> Tuple[np.ndarray, List[dict]]:
+KB_ROOT = Path(__file__).resolve().parent / "uploads" / "knowledge_bases"
+
+
+def _kb_index_paths(kb_id: str) -> Tuple[Path, Path]:
+    safe = "".join(ch for ch in (kb_id or "") if ch.isalnum() or ch in {"_", "-"}).strip()
+    if not safe:
+        raise ValueError("无效知识库 ID")
+    base = KB_ROOT / safe
+    return base / "index_store.npy", base / "index_meta.npy"
+
+
+def load_index(kb_id: str | None = None) -> Tuple[np.ndarray, List[dict]]:
     """从本地加载向量索引与元信息。"""
-    if not settings.index_file.exists() or not settings.meta_file.exists():
+    if kb_id:
+        index_file, meta_file = _kb_index_paths(kb_id)
+    else:
+        index_file, meta_file = settings.index_file, settings.meta_file
+
+    if not index_file.exists() or not meta_file.exists():
+        if kb_id:
+            raise FileNotFoundError("未找到该知识库索引，请先上传文件并构建索引。")
         raise FileNotFoundError("未找到索引文件，请先运行 ingest.py 构建索引。")
 
-    embeddings = np.load(settings.index_file)
-    metadatas = np.load(settings.meta_file, allow_pickle=True).tolist()
+    embeddings = np.load(index_file)
+    metadatas = np.load(meta_file, allow_pickle=True).tolist()
     return embeddings, metadatas
 
 
@@ -125,12 +144,9 @@ def generate_answer(prompt: str) -> str:
     return output
 
 
-def rag_answer(query: str) -> Tuple[str, List[dict]]:
-    """对外暴露的 RAG 主流程。
-
-    返回 (answer, contexts)，方便上层（CLI 或 Web）展示检索到的证据。
-    """
-    embeddings, metadatas = load_index()
+def rag_answer(query: str, kb_id: str | None = None) -> Tuple[str, List[dict]]:
+    """对外暴露的 RAG 主流程。"""
+    embeddings, metadatas = load_index(kb_id=kb_id)
     q_embed = embed_query(query)
     contexts = search_similar_chunks(
         q_embed,
@@ -141,4 +157,3 @@ def rag_answer(query: str) -> Tuple[str, List[dict]]:
     prompt = build_prompt(query, contexts)
     answer = generate_answer(prompt)
     return answer, contexts
-
