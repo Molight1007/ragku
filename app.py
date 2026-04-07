@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import shutil
 import uuid
 from pathlib import Path
 from typing import List, Optional
@@ -10,9 +11,12 @@ from fastapi.middleware.cors import CORSMiddleware
 import numpy as np
 from pydantic import BaseModel
 
+from config import settings
 from rag_service import rag_answer
 
 MAX_UPLOAD_BYTES = 15 * 1024 * 1024
+LEGACY_KB_ID = "legacy_fire"
+LEGACY_KB_NAME = "消防"
 UPLOAD_DIR = Path(__file__).resolve().parent / "uploads"
 KB_ROOT_DIR = UPLOAD_DIR / "knowledge_bases"
 
@@ -52,6 +56,17 @@ def _kb_meta_file(kb_id: str) -> Path:
 
 def _kb_name_file(kb_id: str) -> Path:
     return _kb_dir(kb_id) / "name.txt"
+
+
+def _legacy_index_exists() -> bool:
+    return settings.index_file.exists() and settings.meta_file.exists()
+
+
+def _resolve_rag_kb_id(kb_id: Optional[str]) -> Optional[str]:
+    safe_id = _safe_kb_id((kb_id or "").strip()) if kb_id else None
+    if safe_id == LEGACY_KB_ID:
+        return None
+    return safe_id
 
 
 class ChatRequest(BaseModel):
@@ -219,6 +234,10 @@ def _build_embeddings_for_kb(docs: List[tuple[str, str]]):
 def _list_kb_items() -> List[KnowledgeBaseInfo]:
     _ensure_kb_root_dir()
     items: List[KnowledgeBaseInfo] = []
+
+    if _legacy_index_exists():
+        items.append(KnowledgeBaseInfo(id=LEGACY_KB_ID, name=LEGACY_KB_NAME, file_count=0))
+
     for p in KB_ROOT_DIR.iterdir():
         if not p.is_dir():
             continue
@@ -291,6 +310,30 @@ async def api_kb_upload(kb_id: str = Form(...), file: UploadFile = File(...)) ->
     kb_name = _kb_name_file(safe_id).read_text(encoding="utf-8", errors="ignore").strip() or safe_id
     file_count = len([x for x in files_dir.rglob("*") if x.is_file()])
     return KnowledgeBaseInfo(id=safe_id, name=kb_name, file_count=file_count)
+
+
+@app.delete("/api/kb/{kb_id}")
+async def api_kb_delete(kb_id: str) -> dict:
+    safe_id = _safe_kb_id(kb_id)
+
+    if safe_id == LEGACY_KB_ID:
+        removed = False
+        if settings.index_file.exists():
+            settings.index_file.unlink()
+            removed = True
+        if settings.meta_file.exists():
+            settings.meta_file.unlink()
+            removed = True
+        if not removed:
+            raise HTTPException(status_code=404, detail="知识库不存在")
+        return {"ok": True}
+
+    base = _kb_dir(safe_id)
+    if not base.exists() or not base.is_dir():
+        raise HTTPException(status_code=404, detail="知识库不存在")
+
+    shutil.rmtree(base)
+    return {"ok": True}
 
 
 @app.get("/chat-ui", response_class=HTMLResponse)
@@ -1162,13 +1205,40 @@ async def chat_ui() -> str:
                     var uploadBtn = document.createElement('button');
                     uploadBtn.type = 'button';
                     uploadBtn.textContent = '上传文件';
+                    uploadBtn.disabled = kb.id === 'legacy_fire';
                     uploadBtn.addEventListener('click', function () {
+                        if (kb.id === 'legacy_fire') {
+                            setStatus('“消防”是历史默认索引，不支持直接上传，请新建知识库后上传');
+                            return;
+                        }
                         kbUploadTargetId = kb.id;
                         if (kbFileInput) kbFileInput.click();
                     });
 
+                    var deleteBtn = document.createElement('button');
+                    deleteBtn.type = 'button';
+                    deleteBtn.textContent = '删除';
+                    deleteBtn.addEventListener('click', async function () {
+                        var ok = window.confirm('确认删除知识库「' + (kb.name || kb.id) + '」吗？此操作不可恢复。');
+                        if (!ok) return;
+                        try {
+                            const resp = await fetch(apiUrl('/api/kb/' + encodeURIComponent(kb.id)), { method: 'DELETE' });
+                            const data = await resp.json().catch(function () { return {}; });
+                            if (!resp.ok) throw new Error((data && data.detail) ? data.detail : ('HTTP ' + resp.status));
+                            if (selectedKbId === kb.id) {
+                                selectedKbId = null;
+                                localStorage.removeItem(KB_SELECTED_KEY);
+                            }
+                            await refreshKbListAndRender();
+                            setStatus('已删除知识库：' + (kb.name || kb.id));
+                        } catch (err) {
+                            setStatus('删除失败：' + (err.message || err));
+                        }
+                    });
+
                     actions.appendChild(selectBtn);
                     actions.appendChild(uploadBtn);
+                    actions.appendChild(deleteBtn);
                     item.appendChild(actions);
                     kbList.appendChild(item);
                 })(kbItems[i]);
@@ -1836,7 +1906,10 @@ async def chat(body: ChatRequest) -> ChatResponse:
         return ChatResponse(answer="请输入问题，或先上传文件完成识别后再发送。", contexts=[])
 
     try:
-        answer, contexts_raw = rag_answer(_effective_rag_query(q, a), kb_id=(body.kb_id or None))
+        answer, contexts_raw = rag_answer(
+            _effective_rag_query(q, a),
+            kb_id=_resolve_rag_kb_id(body.kb_id),
+        )
     except FileNotFoundError as e:
         raise HTTPException(status_code=404, detail=str(e)) from e
 
