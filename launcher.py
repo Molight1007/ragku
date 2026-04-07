@@ -28,6 +28,32 @@ CHAT_URL = "http://127.0.0.1:8000/chat-ui"
 SERVER_PORT = 8000
 
 
+def _server_command() -> list[str]:
+    """返回启动服务的命令。
+
+    说明：
+    - 开发模式用 `python -m uvicorn app:app ...`
+    - 打包后（frozen）用当前 exe 的 `--serve` 子命令，避免 `-m uvicorn` 失效。
+    """
+    if getattr(sys, "frozen", False):
+        return [
+            sys.executable,
+            "--serve",
+            "--port",
+            str(SERVER_PORT),
+        ]
+    return [
+        sys.executable,
+        "-m",
+        "uvicorn",
+        "app:app",
+        "--host",
+        "0.0.0.0",
+        "--port",
+        str(SERVER_PORT),
+    ]
+
+
 def _port_in_use(port: int) -> bool:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.settimeout(0.5)
@@ -177,7 +203,7 @@ def console_main() -> None:
                 continue
             _apply_env_key()
             server_proc = subprocess.Popen(
-                [sys.executable, "-m", "uvicorn", "app:app", "--host", "0.0.0.0", "--port", str(SERVER_PORT)],
+                _server_command(),
                 cwd=str(APP_DIR),
                 env=os.environ.copy(),
             )
@@ -398,16 +424,7 @@ class LauncherApp:
             if sys.platform == "win32":
                 kw["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
             self.server_proc = subprocess.Popen(
-                [
-                    sys.executable,
-                    "-m",
-                    "uvicorn",
-                    "app:app",
-                    "--host",
-                    "0.0.0.0",
-                    "--port",
-                    str(SERVER_PORT),
-                ],
+                _server_command(),
                 **kw,
             )
         except Exception as e:  # noqa: BLE001
@@ -477,6 +494,21 @@ def main_gui() -> None:
 
 
 def main() -> None:
+    if "--serve" in sys.argv:
+        import argparse
+
+        parser = argparse.ArgumentParser(add_help=False)
+        parser.add_argument("--serve", action="store_true")
+        parser.add_argument("--port", type=int, default=SERVER_PORT)
+        args, _ = parser.parse_known_args()
+
+        _apply_env_key()
+        os.chdir(str(APP_DIR))
+        import uvicorn
+
+        uvicorn.run("app:app", host="0.0.0.0", port=int(args.port), log_level="info")
+        return
+
     if "--console" in sys.argv:
         console_main()
     else:
