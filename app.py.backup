@@ -12,9 +12,6 @@ from typing import List, Optional
 import dashscope
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
-
-# 新上传系统导入
-from upload_api import router as upload_router, init_upload_system
 from fastapi.responses import HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
 import numpy as np
@@ -375,53 +372,49 @@ async def api_kb_create(body: KnowledgeBaseCreateRequest) -> KnowledgeBaseInfo:
     return KnowledgeBaseInfo(id=kb_id, name=kb_name, file_count=0)
 
 
-
 @app.post("/api/kb/upload", response_model=KnowledgeBaseInfo)
-async def api_kb_upload(
-    kb_id: str = Form(...), 
-    file: UploadFile = File(..., max_length=MAX_FILE_SIZE)
-) -> KnowledgeBaseInfo:
-    """上传文件到知识库（新版，使用分块上传系统）"""
-    from upload_api import upload_file_complete
-    
-    try:
-        # 使用新上传系统的完整API
-        result = await upload_file_complete(
-            kb_id=kb_id,
-            file=file,
-            priority="normal"
-        )
-        
-        if not result.success:
-            raise HTTPException(status_code=500, detail=result.message)
-        
-        # 转换为旧API格式
-        base = _kb_dir(kb_id)
-        files_dir = _kb_files_dir(kb_id)
-        file_count = len([x for x in files_dir.rglob("*") if x.is_file()]) if files_dir.exists() else 0
-        total_size = sum(p.stat().st_size for p in files_dir.glob("*") if p.is_file())
-        
-        # 获取知识库名称
-        kb_name = "未知"
-        name_file = _kb_name_file(kb_id)
-        if name_file.exists():
-            try:
-                kb_name = name_file.read_text(encoding="utf-8").strip()
-            except:
-                pass
-        
-        return KnowledgeBaseInfo(
-            id=kb_id,
-            name=kb_name,
-            file_count=file_count,
-            total_size=total_size
-        )
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"文件上传失败: {str(e)}")
+async def api_kb_upload(kb_id: str = Form(...), file: UploadFile = File(...)) -> KnowledgeBaseInfo:
+    from config import settings as app_settings
+    from document_extract import is_allowed_upload, is_image_filename, safe_upload_name
 
+    safe_id = _safe_kb_id(kb_id)
+    base = _kb_dir(safe_id)
+    if not base.exists():
+        raise HTTPException(status_code=404, detail="知识库不存在，请先创建")
+
+    if not file.filename:
+        raise HTTPException(status_code=400, detail="缺少文件名")
+    if not is_allowed_upload(file.filename):
+        raise HTTPException(status_code=400, detail="仅支持 txt、md、pdf、docx 及常见图片格式")
+
+    data = await file.read()
+    if len(data) > MAX_UPLOAD_BYTES:
+        raise HTTPException(status_code=413, detail="文件过大")
+    if is_image_filename(file.filename) and not app_settings.dashscope_api_key:
+        raise HTTPException(status_code=400, detail="未配置 DASHSCOPE_API_KEY，无法对图片调用百炼识别")
+
+    files_dir = _kb_files_dir(safe_id)
+    files_dir.mkdir(parents=True, exist_ok=True)
+
+    incoming_name = safe_upload_name(file.filename)
+    incoming_cmp = incoming_name.lower()
+    for p in files_dir.rglob("*"):
+        if not p.is_file():
+            continue
+        exist_name = p.name
+        if len(exist_name) > 13 and exist_name[12] == "_":
+            exist_name = exist_name[13:]
+        if exist_name.lower() == incoming_cmp:
+            raise HTTPException(status_code=409, detail="已存在同名文件，不能重复上传")
+
+    stored = f"{uuid.uuid4().hex[:12]}_{incoming_name}"
+    (files_dir / stored).write_bytes(data)
+
+    with KB_UPLOAD_LOCK:
+        if safe_id in KB_REBUILD_RUNNING:
+            kb_name = _kb_name_file(safe_id).read_text(encoding="utf-8", errors="ignore").strip() or safe_id
+            file_count = len([x for x in files_dir.rglob("*") if x.is_file()])
+            return KnowledgeBaseInfo(id=safe_id, name=kb_name, file_count=file_count)
         KB_REBUILD_RUNNING.add(safe_id)
         KB_UPLOAD_PROGRESS[safe_id] = {
             "total": 1,
