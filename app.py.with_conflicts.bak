@@ -11,32 +11,12 @@ from typing import List, Optional
 
 import dashscope
 
+# FastAPI核心库
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile, Request
-# 性能优化模块 - 添加性能监控和缓存
-try:
-    from simple_performance import timed, cached, integrate_with_fastapi, cache
-    print("性能优化模块导入成功")
-except ImportError:
-    print("警告: simple_performance 模块未找到，跳过性能优化集成")
-    # 创建空的装饰器防止导入错误
-    def timed(func=None, *args, **kwargs):
-        def decorator(f):
-            return f
-        return decorator if func is None else decorator(func)
-    
-    def cached(func=None, *args, **kwargs):
-        def decorator(f):
-            return f
-        return decorator if func is None else decorator(func)
-    
-    cache = None
-
-# FastAPI增强组件
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 from starlette.exceptions import HTTPException as StarletteHTTPException
-
 
 # 新上传系统导入
 from upload_api import router as upload_router, init_upload_system
@@ -46,6 +26,15 @@ from pydantic import BaseModel
 from config import settings
 from rag_service import load_index, rag_answer, rag_answer_filtered
 
+# 性能优化模块 - 添加性能监控和缓存
+try:
+    from simple_performance import timed, cached, integrate_with_fastapi, cache
+    print("性能优化模块导入成功")
+except ImportError:
+    print("警告: simple_performance 模块未找到，跳过性能优化集成")
+    timed = cached = lambda x: x  # 空装饰器
+    cache = None
+    
 MAX_UPLOAD_BYTES = 15 * 1024 * 1024
 LEGACY_KB_ID = "legacy_fire"
 LEGACY_KB_NAME = "消防"
@@ -126,9 +115,12 @@ class ChatResponse(BaseModel):
     """前端收到的回答数据结构。"""
 
     answer: str
-    contexts: List[ContextSnippet]
+    contexts: List[ContextSnippet] = []
 
 
+<<<<<<< HEAD
+class UploadExtractResponse(BaseModel):
+=======
 class OCRImageResponse(BaseModel):
     """图片 OCR 接口返回。"""
 
@@ -139,11 +131,24 @@ class OCRImageResponse(BaseModel):
 class UploadExtractResponse(BaseModel):
     """文件上传并解析文本后的返回。"""
 
+>>>>>>> origin/zhishiku
     text: str
     filename: str
     saved_path: str
 
 
+<<<<<<< HEAD
+class OCRImageResponse(BaseModel):
+    text: str
+    filename: str
+
+
+class KnowledgeBaseInfo(BaseModel):
+    id: str
+    name: str = ""
+    file_count: int = 0
+    total_size: int = 0
+=======
 class KnowledgeBaseCreateRequest(BaseModel):
     """创建知识库请求。"""
 
@@ -156,6 +161,7 @@ class KnowledgeBaseInfo(BaseModel):
     id: str
     name: str
     file_count: int
+>>>>>>> origin/zhishiku
 
 
 class KnowledgeBaseListResponse(BaseModel):
@@ -184,10 +190,18 @@ class KnowledgeBaseFileListResponse(BaseModel):
     items: List[KnowledgeBaseFileItem]
 
 
+<<<<<<< HEAD
+# 大文件上传配置
+MAX_FILE_SIZE = 500 * 1024 * 1024  # 500MB 最大文件大小
+MAX_REQUEST_BODY_SIZE = MAX_FILE_SIZE  # 请求体大小限制
+
+=======
+>>>>>>> origin/zhishiku
 app = FastAPI(
     title="本地知识库RAG问答系统",
     description="基于阿里云通义千问 + 本地多模态知识库的RAG服务，用于大赛展示。",
     version="1.0.0",
+    max_request_body_size=MAX_REQUEST_BODY_SIZE,
 )
 
 # 注意：allow_credentials=True 时不能使用 allow_origins=["*"]，否则浏览器会拦截跨域请求。
@@ -199,26 +213,95 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# 添加GZIP压缩中间件
-app.add_middleware(GZipMiddleware, minimum_size=1000)
+# 添加压缩中间件，减少大文件传输体积
+app.add_middleware(GZipMiddleware, minimum_size=1024)
 
-# 集成性能优化到FastAPI应用
-try:
-    app = integrate_with_fastapi(app)
-    print("性能优化集成到FastAPI应用完成")
-except Exception as e:
-    print(f"性能优化集成失败: {e}")
+# 全局异常处理 - 文件过大错误 (使用Starlette的HTTPException处理413错误)
+@app.exception_handler(StarletteHTTPException)
+async def http_exception_handler(request: Request, exc: StarletteHTTPException):
+    if exc.status_code == 413:
+        return JSONResponse(
+            status_code=413,
+            content={
+                "error": "文件过大",
+                "detail": f"上传的文件超过最大限制 ({MAX_FILE_SIZE//(1024*1024)}MB)。请尝试压缩文件或上传较小的文件。"
+            }
+        )
+    # 其他HTTP异常保持默认处理
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={"error": exc.detail}
+    )
+
+# 添加请求大小检查中间件
+@app.middleware("http")
+async def check_request_size(request: Request, call_next):
+    # 检查上传相关的端点
+    if request.method == "POST" and "upload" in request.url.path:
+        content_length = request.headers.get('content-length')
+        if content_length:
+            size = int(content_length)
+            if size > MAX_REQUEST_BODY_SIZE:
+                raise StarletteHTTPException(
+                    status_code=413,
+                    detail=f"请求体大小为 {size/(1024*1024):.1f}MB，超过 {MAX_FILE_SIZE/(1024*1024)}MB 限制"
+                )
+    response = await call_next(request)
+    return response
 
 
 @app.get("/")
 async def index() -> dict:
     """简单健康检查接口。"""
+    return {"message": "本地RAG服务运行中"}
+
+
+@app.get("/status")
+async def status() -> dict:
+    """服务器状态查询。"""
+    legacy_index_exists = _legacy_index_exists()
     return {
-        "message": "本地知识库RAG问答系统已启动。",
-        "docs": "/docs",
+        "legacy_index_exists": legacy_index_exists,
+        "legacy_index_name": LEGACY_KB_NAME if legacy_index_exists else None,
+        "kb_count": len(list(KB_ROOT_DIR.iterdir())) if KB_ROOT_DIR.exists() else 0,
     }
 
 
+<<<<<<< HEAD
+@app.post("/chat", response_model=ChatResponse)
+async def chat(request: ChatRequest) -> ChatResponse:
+    """问答接口。"""
+    if not request.question.strip():
+        raise HTTPException(status_code=400, detail="请输入问题")
+
+    try:
+        kb_id = _resolve_rag_kb_id(request.kb_id)
+        if kb_id:
+            index = load_index(_kb_index_file(kb_id), _kb_meta_file(kb_id))
+        else:
+            index = load_index(settings.index_file, settings.meta_file)
+
+        # 无论是否有选中文件，都使用相同的rag_answer函数
+        # 因为rag_service.py中没有rag_answer_filtered函数
+        answer, contexts = rag_answer(
+            question=request.question,
+            attachment_text=request.attachment_text,
+            index=index,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e)) from e
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail="内部错误") from e
+
+    return ChatResponse(answer=answer, contexts=contexts)
+
+
+@app.post("/api/upload/file", response_model=UploadExtractResponse)
+async def api_upload_file(
+    file: UploadFile = File(..., max_length=MAX_FILE_SIZE)
+) -> UploadExtractResponse:
+    """上传文件：保存到本地 uploads/，并尽量提取文本（与知识库支持的类型一致）。支持大文件流式处理。"""
+=======
 @app.post("/api/ocr/image", response_model=OCRImageResponse)
 async def api_ocr_image(file: UploadFile = File(...)) -> OCRImageResponse:
     """上传图片，返回百炼 Qwen-OCR 识别的文字。"""
@@ -245,9 +328,9 @@ async def api_ocr_image(file: UploadFile = File(...)) -> OCRImageResponse:
 
 
 @app.post("/api/upload/file", response_model=UploadExtractResponse)
-@timed(name="文件上传接口")
 async def api_upload_file(file: UploadFile = File(...)) -> UploadExtractResponse:
     """上传文件：保存到本地 uploads/，并尽量提取文本（与知识库支持的类型一致）。"""
+>>>>>>> origin/zhishiku
     from config import settings as app_settings
     from document_extract import (
         extract_text_from_bytes,
@@ -263,6 +346,142 @@ async def api_upload_file(file: UploadFile = File(...)) -> UploadExtractResponse
             status_code=400,
             detail="仅支持 txt、md、pdf、docx 及常见图片格式",
         )
+<<<<<<< HEAD
+    
+    # 检查文件大小
+    file_size = 0
+    if file.size:
+        file_size = file.size
+    elif file.headers.get("content-length"):
+        file_size = int(file.headers.get("content-length"))
+    
+    if file_size > MAX_FILE_SIZE:
+        raise HTTPException(
+            status_code=413,
+            detail=f"文件大小 {file_size/(1024*1024):.1f}MB 超过最大限制 ({MAX_FILE_SIZE/(1024*1024)}MB)"
+        )
+    
+    if is_image_filename(file.filename) and not app_settings.dashscope_api_key:
+        raise HTTPException(status_code=400, detail="未配置 DASHSCOPE_API_KEY，无法对图片调用百炼识别")
+    
+    # 使用临时文件处理大文件，避免内存溢出
+    temp_file = None
+    try:
+        # 小文件直接读取到内存，大文件使用临时文件
+        CHUNK_SIZE = 16 * 1024 * 1024  # 16MB 分块大小
+        data = b""
+        
+        if file_size > 50 * 1024 * 1024:  # 大于50MB使用临时文件
+            import tempfile
+            temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=Path(file.filename).suffix)
+            temp_path = temp_file.name
+            
+            # 流式读取并写入临时文件
+            total_read = 0
+            while chunk := await file.read(CHUNK_SIZE):
+                temp_file.write(chunk)
+                total_read += len(chunk)
+                # 可以在这里添加进度提示，但保持安静模式
+            temp_file.close()
+            
+            # 从临时文件读取数据
+            with open(temp_path, 'rb') as f:
+                data = f.read()
+            # 删除临时文件
+            import os
+            os.unlink(temp_path)
+        else:
+            # 小文件直接读取
+            data = await file.read()
+        
+        try:
+            text = extract_text_from_bytes(file.filename, data)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e)) from e
+        except Exception as e:  # noqa: BLE001
+            raise HTTPException(status_code=422, detail=f"解析文件失败: {e}") from e
+
+        _ensure_upload_dir()
+        stored = f"{uuid.uuid4().hex[:12]}_{safe_upload_name(file.filename)}"
+        dest = UPLOAD_DIR / stored
+        
+        # 大文件使用流式写入
+        if len(data) > 50 * 1024 * 1024:
+            with open(dest, 'wb') as f:
+                f.write(data)
+        else:
+            dest.write_bytes(data)
+            
+        rel = str(dest.relative_to(Path(__file__).resolve().parent)).replace("\\", "/")
+        return UploadExtractResponse(
+            text=(text or "").strip(),
+            filename=file.filename,
+            saved_path=rel,
+        )
+    except Exception as e:
+        # 清理临时文件
+        if temp_file and temp_file.name:
+            try:
+                import os
+                if os.path.exists(temp_file.name):
+                    os.unlink(temp_file.name)
+            except:
+                pass
+        raise HTTPException(status_code=500, detail=f"文件处理失败: {e}")
+    finally:
+        if temp_file:
+            try:
+                temp_file.close()
+            except:
+                pass
+
+
+@app.post("/api/ocr/image", response_model=OCRImageResponse)
+async def api_ocr_image(
+    file: UploadFile = File(..., max_length=100 * 1024 * 1024)  # OCR图片限制100MB
+) -> OCRImageResponse:
+    """上传图片，返回百炼 Qwen-OCR 识别的文字。支持大图片文件。"""
+    from config import settings as app_settings
+    from document_extract import is_image_filename, ocr_image_bytes
+
+    if not app_settings.dashscope_api_key:
+        raise HTTPException(status_code=400, detail="未配置 DASHSCOPE_API_KEY，无法调用百炼图片识别")
+    if not file.filename:
+        raise HTTPException(status_code=400, detail="缺少文件名")
+    if not is_image_filename(file.filename):
+        raise HTTPException(
+            status_code=400,
+            detail="请上传图片文件（jpg / png / bmp / webp / gif）",
+        )
+    
+    # 检查文件大小
+    file_size = 0
+    if file.size:
+        file_size = file.size
+    elif file.headers.get("content-length"):
+        file_size = int(file.headers.get("content-length"))
+    
+    if file_size > 100 * 1024 * 1024:  # 100MB限制
+        raise HTTPException(
+            status_code=413,
+            detail=f"图片文件大小 {file_size/(1024*1024):.1f}MB 超过最大限制 (100MB)。请压缩图片后重试。"
+        )
+    
+    # 使用分块读取大图片
+    data = b""
+    CHUNK_SIZE = 8 * 1024 * 1024  # 8MB分块
+    total_read = 0
+    
+    while chunk := await file.read(CHUNK_SIZE):
+        data += chunk
+        total_read += len(chunk)
+    
+    try:
+        text = ocr_image_bytes(data, file.filename)
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=422, detail=f"图片识别失败: {e}") from e
+    return OCRImageResponse(text=text.strip(), filename=file.filename)
+=======
     data = await file.read()
     if len(data) > MAX_UPLOAD_BYTES:
         raise HTTPException(status_code=413, detail="文件过大")
@@ -408,14 +627,172 @@ async def api_kb_create(body: KnowledgeBaseCreateRequest) -> KnowledgeBaseInfo:
     _kb_name_file(kb_id).write_text(kb_name, encoding="utf-8")
     return KnowledgeBaseInfo(id=kb_id, name=kb_name, file_count=0)
 
+>>>>>>> origin/zhishiku
 
 
 @app.post("/api/kb/upload", response_model=KnowledgeBaseInfo)
-@timed(name="知识库上传接口")
 async def api_kb_upload(
     kb_id: str = Form(...), 
     file: UploadFile = File(..., max_length=MAX_FILE_SIZE)
 ) -> KnowledgeBaseInfo:
+<<<<<<< HEAD
+    """上传文件到知识库，支持大文件流式处理。"""
+    from config import settings as app_settings
+    from document_extract import is_allowed_upload, is_image_filename, safe_upload_name
+
+    safe_id = _safe_kb_id(kb_id)
+    base = _kb_dir(safe_id)
+    if not base.exists():
+        raise HTTPException(status_code=404, detail="知识库不存在，请先创建")
+
+    if not file.filename:
+        raise HTTPException(status_code=400, detail="缺少文件名")
+    if not is_allowed_upload(file.filename):
+        raise HTTPException(status_code=400, detail="仅支持 txt、md、pdf、docx 及常见图片格式")
+    
+    # 检查文件大小
+    file_size = 0
+    if file.size:
+        file_size = file.size
+    elif file.headers.get("content-length"):
+        file_size = int(file.headers.get("content-length"))
+    
+    if file_size > MAX_FILE_SIZE:
+        raise HTTPException(
+            status_code=413,
+            detail=f"文件大小 {file_size/(1024*1024):.1f}MB 超过最大限制 ({MAX_FILE_SIZE/(1024*1024)}MB)"
+        )
+
+    files_dir = _kb_files_dir(safe_id)
+    files_dir.mkdir(parents=True, exist_ok=True)
+
+    incoming_name = safe_upload_name(file.filename)
+    incoming_cmp = incoming_name.lower()
+    for p in files_dir.rglob("*"):
+        if not p.is_file():
+            continue
+        exist_name = p.name
+        if len(exist_name) > 13 and exist_name[12] == "_":
+            exist_name = exist_name[13:]
+        if exist_name.lower() == incoming_cmp:
+            raise HTTPException(status_code=409, detail="已存在同名文件，不能重复上传")
+
+    stored = f"{uuid.uuid4().hex[:12]}_{incoming_name}"
+    dest_path = files_dir / stored
+    
+    # 使用流式写入处理大文件
+    CHUNK_SIZE = 16 * 1024 * 1024  # 16MB分块
+    
+    if is_image_filename(file.filename) and not app_settings.dashscope_api_key:
+        raise HTTPException(status_code=400, detail="未配置 DASHSCOPE_API_KEY，无法对图片调用百炼识别")
+    
+    # 流式写入文件
+    written_size = 0
+    with open(dest_path, 'wb') as dest_file:
+        while chunk := await file.read(CHUNK_SIZE):
+            dest_file.write(chunk)
+            written_size += len(chunk)
+    
+    # 验证文件大小
+    if written_size != file_size and file_size > 0:
+        print(f"文件大小不匹配: 期望 {file_size} 字节，实际写入 {written_size} 字节")
+    
+    from ingest import build_index_for_kb
+    from threading import Thread
+    
+    def async_build():
+        try:
+            build_index_for_kb(safe_id)
+        except Exception as e:
+            print(f"知识库索引构建失败: {e}")
+    
+    Thread(target=async_build, daemon=True).start()
+    
+    file_count = len(list(files_dir.glob("*"))) if files_dir.exists() else 0
+    total_size = sum(p.stat().st_size for p in files_dir.glob("*") if p.is_file())
+    
+    name = ""
+    name_file = _kb_name_file(safe_id)
+    if name_file.exists():
+        name = name_file.read_text(encoding="utf-8").strip()
+    
+    return KnowledgeBaseInfo(
+        id=safe_id,
+        name=name,
+        file_count=file_count,
+        total_size=total_size,
+    )
+
+
+@app.get("/api/kb/list", response_model=KnowledgeBaseListResponse)
+async def api_kb_list() -> KnowledgeBaseListResponse:
+    """获取所有知识库列表。"""
+    _ensure_kb_root_dir()
+    items = []
+    
+    if _legacy_index_exists():
+        items.append(
+            KnowledgeBaseInfo(
+                id=LEGACY_KB_ID,
+                name=LEGACY_KB_NAME,
+                file_count=0,
+                total_size=0,
+            )
+        )
+    
+    for p in KB_ROOT_DIR.iterdir():
+        if not p.is_dir():
+            continue
+        kb_id = p.name
+        if kb_id == LEGACY_KB_ID:
+            continue
+        
+        files_dir = _kb_files_dir(kb_id)
+        file_count = len(list(files_dir.glob("*"))) if files_dir.exists() else 0
+        total_size = sum(
+            p.stat().st_size for p in files_dir.glob("*") if p.is_file()
+        ) if files_dir.exists() else 0
+        
+        name = ""
+        name_file = _kb_name_file(kb_id)
+        if name_file.exists():
+            name = name_file.read_text(encoding="utf-8").strip()
+        
+        items.append(
+            KnowledgeBaseInfo(
+                id=kb_id,
+                name=name,
+                file_count=file_count,
+                total_size=total_size,
+            )
+        )
+    
+    return KnowledgeBaseListResponse(items=items)
+
+
+@app.post("/api/kb/create", response_model=KnowledgeBaseInfo)
+async def api_kb_create(name: str = Form(...)) -> KnowledgeBaseInfo:
+    """创建新知识库。"""
+    import re
+    
+    clean = re.sub(r"[^\w\u4e00-\u9fff\-_ ]", "", name.strip())
+    if not clean:
+        raise HTTPException(status_code=400, detail="知识库名称无效")
+    
+    safe_id = _new_kb_id()
+    base = _kb_dir(safe_id)
+    if base.exists():
+        raise HTTPException(status_code=409, detail="知识库ID重复，请重试")
+    
+    base.mkdir(parents=True)
+    _kb_name_file(safe_id).write_text(clean, encoding="utf-8")
+    
+    return KnowledgeBaseInfo(
+        id=safe_id,
+        name=clean,
+        file_count=0,
+        total_size=0,
+=======
     """上传文件到知识库（新版，使用分块上传系统）"""
     from upload_api import upload_file_complete
     
@@ -514,11 +891,68 @@ async def api_kb_progress(kb_id: str) -> KnowledgeBaseUploadProgress:
         processed_chunks=int(p.get("processed", 0)),
         done=bool(p.get("done", False)),
         message=str(p.get("message", "")),
+>>>>>>> origin/zhishiku
     )
 
 
 @app.get("/api/kb/{kb_id}/files", response_model=KnowledgeBaseFileListResponse)
 async def api_kb_files(kb_id: str) -> KnowledgeBaseFileListResponse:
+<<<<<<< HEAD
+    """获取知识库内的文件列表。"""
+    safe_id = _safe_kb_id(kb_id)
+    if not safe_id:
+        raise HTTPException(status_code=404, detail="知识库不存在")
+    
+    files_dir = _kb_files_dir(safe_id)
+    if not files_dir.exists():
+        return KnowledgeBaseFileListResponse(kb_id=safe_id, items=[])
+    
+    items = []
+    for p in sorted(files_dir.glob("*")):
+        if not p.is_file():
+            continue
+        name = p.name
+        if len(name) > 13 and name[12] == "_":
+            name = name[13:]
+        items.append(
+            KnowledgeBaseFileItem(
+                name=name,
+                rel_path=str(p.relative_to(files_dir)).replace("\\", "/"),
+                size=p.stat().st_size,
+            )
+        )
+    
+    return KnowledgeBaseFileListResponse(kb_id=safe_id, items=items)
+
+
+@app.get("/api/kb/{kb_id}/index_progress", response_model=KnowledgeBaseUploadProgress)
+async def api_kb_index_progress(kb_id: str) -> KnowledgeBaseUploadProgress:
+    """获取知识库向量化进度。"""
+    safe_id = _safe_kb_id(kb_id)
+    if not safe_id:
+        raise HTTPException(status_code=404, detail="知识库不存在")
+    
+    meta_file = _kb_meta_file(safe_id)
+    if not meta_file.exists():
+        return KnowledgeBaseUploadProgress(
+            total_chunks=0, processed_chunks=0, done=False, message="未开始构建"
+        )
+    
+    try:
+        meta = np.load(meta_file, allow_pickle=True).item()
+        total = meta.get("total_chunks", 0)
+        processed = meta.get("processed_chunks", 0)
+        return KnowledgeBaseUploadProgress(
+            total_chunks=total,
+            processed_chunks=processed,
+            done=processed >= total,
+            message=f"{processed}/{total}" if total > 0 else "构建中",
+        )
+    except Exception:  # noqa: BLE001
+        return KnowledgeBaseUploadProgress(
+            total_chunks=0, processed_chunks=0, done=True, message="已构建"
+        )
+=======
     safe_id = _safe_kb_id(kb_id)
     if safe_id == LEGACY_KB_ID:
         if not _legacy_index_exists():
@@ -609,10 +1043,265 @@ async def api_kb_delete_file(kb_id: str, rel_path: str) -> dict:
 
     asyncio.create_task(_rebuild_after_delete())
     return {"ok": True}
+>>>>>>> origin/zhishiku
 
 
 @app.delete("/api/kb/{kb_id}")
 async def api_kb_delete(kb_id: str) -> dict:
+<<<<<<< HEAD
+    """删除知识库。"""
+    safe_id = _safe_kb_id(kb_id)
+    if not safe_id:
+        raise HTTPException(status_code=404, detail="知识库不存在")
+    if safe_id == LEGACY_KB_ID:
+        raise HTTPException(status_code=400, detail="不能删除默认知识库")
+    
+    base = _kb_dir(safe_id)
+    if base.exists():
+        shutil.rmtree(base, ignore_errors=True)
+    
+    return {"status": "ok"}
+
+
+@app.get("/chat-ui", response_class=HTMLResponse)
+async def chat_ui():
+    """返回前端HTML页面。"""
+    html_content = """
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>本地知识库RAG问答系统</title>
+    <style>
+        :root {
+            --primary: #2563eb;
+            --primary-hover: #1d4ed8;
+            --secondary: #64748b;
+            --success: #10b981;
+            --danger: #ef4444;
+            --warning: #f59e0b;
+            --background: #f8fafc;
+            --surface: #ffffff;
+            --border: #e2e8f0;
+            --text: #334155;
+            --text-muted: #64748b;
+            --radius: 12px;
+            --shadow: 0 4px 20px rgba(0, 0, 0, 0.08);
+            --shadow-hover: 0 8px 30px rgba(0, 0, 0, 0.12);
+        }
+
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+        }
+
+        body {
+            background: var(--background);
+            color: var(--text);
+            line-height: 1.5;
+            padding: 16px;
+            min-height: 100vh;
+        }
+
+        .chat-container {
+            max-width: 1200px;
+            margin: 0 auto;
+            display: flex;
+            gap: 24px;
+            min-height: calc(100vh - 32px);
+        }
+
+        .main-panel {
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+            gap: 20px;
+        }
+
+        .knowledge-panel {
+            width: 320px;
+            min-width: 320px;
+            display: flex;
+            flex-direction: column;
+            gap: 16px;
+            position: relative;
+        }
+
+        .card {
+            background: var(--surface);
+            border: 1px solid var(--border);
+            border-radius: var(--radius);
+            padding: 24px;
+            box-shadow: var(--shadow);
+            transition: box-shadow 0.2s ease;
+        }
+        .card:hover {
+            box-shadow: var(--shadow-hover);
+        }
+
+        .header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 20px;
+        }
+
+        .title {
+            font-size: 24px;
+            font-weight: 700;
+            color: var(--primary);
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+        .title::before {
+            content: "💬";
+        }
+
+        .subtitle {
+            font-size: 14px;
+            color: var(--text-muted);
+            margin-top: 4px;
+        }
+
+        .chat-history {
+            flex: 1;
+            min-height: 400px;
+            max-height: 600px;
+            overflow-y: auto;
+            padding: 8px;
+            border: 1px solid var(--border);
+            border-radius: var(--radius);
+            background: var(--surface);
+        }
+
+        .message {
+            margin-bottom: 16px;
+            padding: 16px;
+            border-radius: 16px;
+            max-width: 85%;
+            animation: fadeIn 0.3s ease;
+        }
+        @keyframes fadeIn {
+            from { opacity: 0; transform: translateY(8px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+
+        .user-message {
+            background: var(--primary);
+            color: white;
+            margin-left: auto;
+            border-bottom-right-radius: 4px;
+        }
+
+        .bot-message {
+            background: var(--surface);
+            border: 1px solid var(--border);
+            margin-right: auto;
+            border-bottom-left-radius: 4px;
+        }
+
+        .message-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 8px;
+            font-size: 12px;
+            opacity: 0.8;
+        }
+
+        .message-content {
+            line-height: 1.6;
+            white-space: pre-wrap;
+            word-break: break-word;
+        }
+
+        .message-contexts {
+            margin-top: 12px;
+            padding-top: 12px;
+            border-top: 1px dashed var(--border);
+            font-size: 13px;
+            color: var(--text-muted);
+        }
+
+        .context-item {
+            background: var(--background);
+            padding: 8px 12px;
+            border-radius: 8px;
+            margin-bottom: 8px;
+            border-left: 3px solid var(--primary);
+        }
+        .context-item:last-child {
+            margin-bottom: 0;
+        }
+
+        .context-source {
+            font-weight: 600;
+            margin-bottom: 4px;
+            color: var(--primary);
+        }
+
+        .context-preview {
+            font-size: 12px;
+            opacity: 0.8;
+            display: -webkit-box;
+            -webkit-line-clamp: 2;
+            -webkit-box-orient: vertical;
+            overflow: hidden;
+        }
+
+        .context-score {
+            font-size: 11px;
+            color: var(--success);
+            font-weight: 500;
+            margin-top: 4px;
+        }
+
+        .input-area {
+            position: relative;
+        }
+
+        .input-wrapper {
+            position: relative;
+            display: flex;
+            gap: 8px;
+        }
+
+        .question-input {
+            flex: 1;
+            padding: 16px 20px;
+            border: 2px solid var(--border);
+            border-radius: 24px;
+            font-size: 16px;
+            background: var(--surface);
+            transition: all 0.2s ease;
+            resize: none;
+            min-height: 56px;
+            max-height: 200px;
+        }
+        .question-input:focus {
+            outline: none;
+            border-color: var(--primary);
+            box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.1);
+        }
+
+        .send-button {
+            position: absolute;
+            right: 8px;
+            bottom: 8px;
+            background: var(--primary);
+            color: white;
+            border: none;
+            border-radius: 50%;
+            width: 40px;
+            height: 40px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+=======
     safe_id = _safe_kb_id(kb_id)
 
     with KB_UPLOAD_LOCK:
@@ -964,8 +1653,18 @@ async def chat_ui() -> str:
             background: #fff;
             font-size: 12px;
             padding: 6px 8px;
+>>>>>>> origin/zhishiku
             cursor: pointer;
+            transition: all 0.2s ease;
         }
+<<<<<<< HEAD
+        .send-button:hover:not(:disabled) {
+            background: var(--primary-hover);
+            transform: translateY(-1px);
+        }
+        .send-button:disabled {
+            opacity: 0.5;
+=======
         .kb-delete-x {
             width: 28px;
             height: 28px;
@@ -982,6 +1681,7 @@ async def chat_ui() -> str:
             border-color: #fecaca;
         }
         .kb-delete-x:disabled {
+>>>>>>> origin/zhishiku
             cursor: not-allowed;
             color: #9ca3af;
             background: #fff;
@@ -1365,9 +2065,271 @@ async def chat_ui() -> str:
             border-radius: 2px;
             background: #fff;
         }
-        .status {
-            margin-top: 8px;
+        .send-button::before {
+            content: "➤";
+            font-size: 18px;
+            margin-left: 2px;
+        }
+
+        .attachments {
+            margin-top: 12px;
+            display: flex;
+            gap: 8px;
+            flex-wrap: wrap;
+        }
+
+        .attachment-item {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            background: var(--background);
+            padding: 6px 12px;
+            border-radius: 16px;
+            font-size: 13px;
+            border: 1px solid var(--border);
+        }
+
+        .remove-attachment {
+            color: var(--danger);
+            cursor: pointer;
+            font-weight: bold;
+            padding: 0 4px;
+        }
+
+        .button-group {
+            display: flex;
+            gap: 8px;
+            margin-top: 12px;
+        }
+
+        .btn {
+            padding: 8px 16px;
+            border: 2px solid var(--border);
+            border-radius: 20px;
+            background: var(--surface);
+            color: var(--text);
+            font-size: 14px;
+            font-weight: 500;
+            cursor: pointer;
+            transition: all 0.2s ease;
+            display: flex;
+            align-items: center;
+            gap: 6px;
+        }
+        .btn:hover {
+            background: var(--background);
+            border-color: var(--primary);
+        }
+
+        .btn-primary {
+            background: var(--primary);
+            color: white;
+            border-color: var(--primary);
+        }
+        .btn-primary:hover {
+            background: var(--primary-hover);
+            border-color: var(--primary-hover);
+        }
+
+        .btn-success {
+            background: var(--success);
+            color: white;
+            border-color: var(--success);
+        }
+
+        .btn-danger {
+            background: var(--danger);
+            color: white;
+            border-color: var(--danger);
+        }
+
+        .knowledge-header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            margin-bottom: 16px;
+        }
+
+        .knowledge-title {
+            font-size: 18px;
+            font-weight: 600;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+        .knowledge-title::before {
+            content: "📚";
+        }
+
+        .knowledge-list {
+            max-height: 300px;
+            overflow-y: auto;
+        }
+
+        .knowledge-item {
+            padding: 12px 16px;
+            border: 1px solid var(--border);
+            border-radius: 12px;
+            margin-bottom: 8px;
+            cursor: pointer;
+            transition: all 0.2s ease;
+        }
+        .knowledge-item:hover {
+            background: var(--background);
+            border-color: var(--primary);
+        }
+        .knowledge-item.active {
+            background: var(--primary);
+            color: white;
+            border-color: var(--primary);
+        }
+
+        .knowledge-name {
+            font-weight: 600;
+            margin-bottom: 4px;
+        }
+
+        .knowledge-meta {
             font-size: 12px;
+<<<<<<< HEAD
+            opacity: 0.8;
+            display: flex;
+            justify-content: space-between;
+        }
+
+        .knowledge-actions {
+            display: flex;
+            gap: 8px;
+            margin-top: 12px;
+        }
+
+        .progress-container {
+            margin: 16px 0;
+        }
+
+        .progress-bar {
+            height: 8px;
+            background: var(--border);
+            border-radius: 4px;
+            overflow: hidden;
+            margin-bottom: 8px;
+        }
+
+        .progress-fill {
+            height: 100%;
+            background: var(--primary);
+            border-radius: 4px;
+            transition: width 0.3s ease;
+        }
+
+        .progress-text {
+            font-size: 12px;
+            color: var(--text-muted);
+            text-align: center;
+        }
+
+        .file-list {
+            max-height: 400px;
+            overflow-y: auto;
+        }
+
+        .file-item {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 8px 12px;
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            margin-bottom: 6px;
+            font-size: 13px;
+        }
+
+        .file-name {
+            flex: 1;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+
+        .file-size {
+            color: var(--text-muted);
+            font-size: 12px;
+            margin-left: 8px;
+        }
+
+        .status-bar {
+            position: fixed;
+            bottom: 16px;
+            left: 50%;
+            transform: translateX(-50%);
+            background: var(--surface);
+            border: 1px solid var(--border);
+            border-radius: 20px;
+            padding: 10px 20px;
+            font-size: 14px;
+            box-shadow: var(--shadow);
+            z-index: 100;
+            opacity: 0;
+            transition: opacity 0.3s ease;
+            max-width: 80%;
+            text-align: center;
+        }
+        .status-bar.show {
+            opacity: 1;
+        }
+
+        .status-success {
+            color: var(--success);
+            border-color: var(--success);
+        }
+
+        .status-error {
+            color: var(--danger);
+            border-color: var(--danger);
+        }
+
+        .status-warning {
+            color: var(--warning);
+            border-color: var(--warning);
+        }
+
+        .upload-tips {
+            margin: 10px 16px;
+            padding: 12px;
+            background: #f0f9ff;
+            border: 1px solid #d1ecff;
+            border-radius: 12px;
+            font-size: 13px;
+            color: #0c5460;
+            line-height: 1.4;
+        }
+        .upload-tips strong {
+            font-weight: 600;
+            color: #155724;
+        }
+        .upload-tips ul {
+            margin: 6px 0 0 0;
+            padding-left: 20px;
+        }
+        .upload-tips li {
+            margin-bottom: 3px;
+        }
+        .large-file-warning {
+            color: #856404;
+            background-color: #fff3cd;
+            border: 1px solid #ffeaa7;
+        }
+        .large-file-warning strong {
+            color: #856404;
+        }
+
+        @media (max-width: 768px) {
+            .chat-container {
+                flex-direction: column;
+            }
+            .knowledge-panel {
+                width: 100%;
+=======
             color: #7a808f;
             text-align: center;
         }
@@ -1378,6 +2340,7 @@ async def chat_ui() -> str:
             .welcome {
                 font-size: 30px;
                 margin-top: 26px;
+>>>>>>> origin/zhishiku
             }
             .question-input {
                 font-size: 16px;
@@ -1386,6 +2349,214 @@ async def chat_ui() -> str:
     </style>
 </head>
 <body>
+<<<<<<< HEAD
+    <div class="chat-container">
+        <!-- 主聊天区域 -->
+        <div class="main-panel">
+            <div class="card">
+                <div class="header">
+                    <div>
+                        <div class="title">本地知识库RAG问答系统</div>
+                        <div class="subtitle">基于阿里云通义千问 + 本地多模态知识库</div>
+                    </div>
+                    <div class="button-group">
+                        <button class="btn" onclick="uploadFile()">
+                            <span>📤</span> 上传文件
+                        </button>
+                        <button class="btn" onclick="uploadImage()">
+                            <span>🖼️</span> OCR图片
+                        </button>
+                        <input type="file" id="fileInput" style="display: none" accept=".txt,.md,.pdf,.docx,.jpg,.jpeg,.png,.gif,.bmp,.webp">
+                        <input type="file" id="imageInput" style="display: none" accept=".jpg,.jpeg,.png,.gif,.bmp,.webp">
+                    </div>
+                </div>
+
+                <!-- 聊天历史 -->
+                <div class="chat-history" id="chatHistory">
+                    <!-- 消息动态生成 -->
+                </div>
+
+                <!-- 附件区域 -->
+                <div class="attachments" id="attachments">
+                    <!-- 附件动态生成 -->
+                </div>
+
+                <!-- 输入区域 -->
+                <div class="input-area">
+                    <div class="input-wrapper">
+                        <textarea
+                            class="question-input"
+                            id="questionInput"
+                            placeholder="输入您的问题..."
+                            rows="3"
+                            onkeydown="handleKeydown(event)"
+                        ></textarea>
+                        <button class="send-button" id="sendButton" onclick="sendQuestion()" disabled></button>
+                    </div>
+                    
+                    <div class="button-group">
+                        <button class="btn" onclick="clearChat()">
+                            <span>🗑️</span> 清空对话
+                        </button>
+                        <button class="btn" onclick="toggleKnowledgePanel()">
+                            <span>📚</span> 知识库管理
+                        </button>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- 知识库面板 -->
+        <div class="knowledge-panel" id="knowledgePanel" style="display: none;">
+            <div class="card">
+                <div class="knowledge-header">
+                    <div class="knowledge-title">知识库管理</div>
+                    <button class="btn" onclick="toggleKnowledgePanel()">
+                        <span>✕</span>
+                    </button>
+                </div>
+                
+                <div class="upload-tips large-file-warning">
+                    <strong>📋 文件上传提示</strong>
+                    <ul>
+                        <li>支持 <strong>txt, md, pdf, docx</strong> 文件及常见图片格式</li>
+                        <li>最大文件大小：<strong>500MB</strong></li>
+                        <li>大文件（>100MB）上传需要稳定的网络连接</li>
+                        <li>图片文件会自动通过OCR提取文字</li>
+                    </ul>
+                </div>
+
+                <!-- 创建知识库 -->
+                <div style="margin-bottom: 16px;">
+                    <input type="text" id="kbNameInput" placeholder="输入知识库名称" 
+                           style="width: 100%; padding: 10px 14px; border: 1px solid var(--border); border-radius: 8px;">
+                    <button class="btn" onclick="createKnowledgeBase()" 
+                            style="width: 100%; margin-top: 8px;">
+                        <span>➕</span> 创建知识库
+                    </button>
+                </div>
+
+                <!-- 知识库列表 -->
+                <div class="knowledge-list" id="knowledgeList">
+                    <!-- 动态生成 -->
+                </div>
+
+                <!-- 文件上传 -->
+                <div style="margin-top: 16px;">
+                    <input type="file" id="kbFileInput" multiple style="display: none" 
+                           accept=".txt,.md,.pdf,.docx,.jpg,.jpeg,.png,.gif,.bmp,.webp">
+                    <button class="btn btn-primary" id="kbUploadButton" onclick="document.getElementById('kbFileInput').click()"
+                            style="width: 100%;">
+                        <span>📁</span> 上传文件到知识库
+                    </button>
+                    
+                    <!-- 上传进度条 -->
+                    <div class="progress-container" id="uploadProgressContainer" style="display: none; margin-top: 12px;">
+                        <div class="progress-bar">
+                            <div class="progress-fill" id="uploadProgressFill" style="width: 0%"></div>
+                        </div>
+                        <div class="progress-text" id="uploadProgressText">准备上传...</div>
+                        <div class="progress-details" id="uploadProgressDetails" style="font-size: 11px; color: var(--text-muted); margin-top: 4px;"></div>
+                    </div>
+                </div>
+
+                <!-- 文件列表 -->
+                <div class="file-list" id="fileList" style="margin-top: 16px;">
+                    <!-- 动态生成 -->
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- 状态栏 -->
+    <div class="status-bar" id="statusBar"></div>
+
+    <script>
+        let selectedKbId = localStorage.getItem('kb_selected_id') || null;
+        let kbUploadTargetId = null;
+        let attachments = [];
+
+        function setStatus(text, type = 'info') {
+            const bar = document.getElementById('statusBar');
+            bar.textContent = text;
+            bar.className = 'status-bar show';
+            bar.classList.remove('status-success', 'status-error', 'status-warning');
+            if (type !== 'info') bar.classList.add('status-' + type);
+            setTimeout(() => bar.classList.remove('show'), type === 'error' ? 5000 : 3000);
+        }
+
+        function apiUrl(path) {
+            var base = (window.location.origin && window.location.origin !== 'null')
+                ? window.location.origin
+                : 'http://127.0.0.1:8001';
+            return new URL(path, base).href;
+        }
+
+        function explainFetchError(err) {
+            if (err && err.name === 'TypeError') {
+                return '无法连接服务器。请用地址栏打开 ' + window.location.origin + '/chat-ui（不要用本地离线网页），并确认本机已启动 uvicorn。';
+            }
+            return (err && err.message) ? err.message : String(err);
+        }
+
+        /* ========== 上传进度条相关函数 ========== */
+        
+        /**
+         * 显示或隐藏上传进度条
+         * @param {boolean} show - 是否显示进度条
+         */
+        function toggleUploadProgress(show) {
+            const container = document.getElementById('uploadProgressContainer');
+            const button = document.getElementById('kbUploadButton');
+            if (container) {
+                container.style.display = show ? 'block' : 'none';
+            }
+            if (button) {
+                button.disabled = show;
+            }
+            if (!show) {
+                // 重置进度条
+                updateUploadProgress(0, '准备上传...', '');
+            }
+        }
+        
+        /**
+         * 更新上传进度条
+         * @param {number} percent - 进度百分比 (0-100)
+         * @param {string} text - 进度文本
+         * @param {string} details - 详细进度信息
+         */
+        function updateUploadProgress(percent, text, details) {
+            const fill = document.getElementById('uploadProgressFill');
+            const textEl = document.getElementById('uploadProgressText');
+            const detailsEl = document.getElementById('uploadProgressDetails');
+            
+            if (fill) {
+                fill.style.width = percent + '%';
+            }
+            if (textEl) {
+                textEl.textContent = text;
+            }
+            if (detailsEl) {
+                detailsEl.textContent = details;
+            }
+        }
+        
+        /**
+         * 检查文件是否重复（基于文件名和文件大小）
+         * @param {File} file - 要检查的文件
+         * @param {Array<File>} existingFiles - 已存在的文件列表
+         * @returns {boolean} 是否重复
+         */
+        function isDuplicateFile(file, existingFiles) {
+            if (!existingFiles || existingFiles.length === 0) return false;
+            
+            for (const existingFile of existingFiles) {
+                // 检查文件名和大小是否完全相同
+                if (existingFile.name === file.name && existingFile.size === file.size) {
+                    return true;
+                }
+=======
     <div class="page">
         <div class="top-tools">
             <button type="button" id="menuBtn" class="menu-btn" aria-label="打开菜单" title="菜单">
@@ -2407,9 +3578,309 @@ async def chat_ui() -> str:
                 chatAbortController = null;
                 setSendBtnBusy(false);
                 setTimeout(function () { setStatus('就绪'); }, 800);
+>>>>>>> origin/zhishiku
             }
+            return false;
+        }
+        
+        /**
+         * 获取文件大小的人类可读格式
+         * @param {number} bytes - 文件大小（字节）
+         * @returns {string} 可读格式（如 2.5MB）
+         */
+        function formatFileSize(bytes) {
+            if (bytes === 0) return '0 B';
+            const k = 1024;
+            const sizes = ['B', 'KB', 'MB', 'GB'];
+            const i = Math.floor(Math.log(bytes) / Math.log(k));
+            return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
+        }
+        
+        /* ========== 上传进度条相关函数结束 ========== */
+
+        async function uploadKbFileWithProgress(kbId, file, index, total) {
+            return await new Promise(function (resolve, reject) {
+                var xhr = new XMLHttpRequest();
+                xhr.open('POST', apiUrl('/api/kb/upload'));
+                xhr.responseType = 'json';
+                xhr.timeout = 30 * 60 * 1000; // 30分钟超时，用于大文件上传
+
+                xhr.upload.onprogress = function (evt) {
+                    if (evt.lengthComputable && evt.total > 0) {
+                        var p = Math.round((evt.loaded / evt.total) * 100);
+                        var loadedMB = (evt.loaded / (1024 * 1024)).toFixed(1);
+                        var totalMB = (evt.total / (1024 * 1024)).toFixed(1);
+                        var speedMBps = ' -- ';
+                        if (evt.timeStamp && evt.loaded > 0) {
+                            var seconds = evt.timeStamp / 1000;
+                            if (seconds > 0) {
+                                speedMBps = (evt.loaded / (1024 * 1024) / seconds).toFixed(2) + 'MB/s';
+                            }
+                        }
+                        
+                        // 更新视觉进度条
+                        updateUploadProgress(
+                            p,
+                            `上传中 (${index}/${total}): ${file.name} ${p}%`,
+                            `${loadedMB}MB/${totalMB}MB | ${speedMBps} | 剩余: ${evt.timeStamp ? ((evt.total - evt.loaded) / (evt.loaded / (evt.timeStamp / 1000))).toFixed(1) + 's' : '--'}`
+                        );
+                        
+                        // 同时更新状态栏（兼容）
+                        setStatus('文件传输中（' + index + '/' + total + '）：' + file.name + ' ' + p + '% (' + loadedMB + 'MB/' + totalMB + 'MB)');
+                    } else {
+                        updateUploadProgress(
+                            0,
+                            `准备上传 (${index}/${total}): ${file.name}`,
+                            '正在计算文件大小...'
+                        );
+                        setStatus('文件传输中（' + index + '/' + total + '）：' + file.name);
+                    }
+                };
+
+                xhr.onload = function () {
+                    var data = xhr.response;
+                    if (!data && xhr.responseText) {
+                        try { data = JSON.parse(xhr.responseText); } catch (e) {}
+                    }
+                    if (xhr.status >= 200 && xhr.status < 300) {
+                        resolve(data || {});
+                    } else {
+                        // 特定状态码的错误处理
+                        var errorMsg = (data && data.detail) ? data.detail : ('HTTP ' + xhr.status);
+                        if (xhr.status === 413) {
+                            errorMsg = '文件太大，上传失败。' + (data && data.detail ? data.detail : '');
+                        } else if (xhr.status === 400) {
+                            errorMsg = '文件格式不支持或有误：' + (data && data.detail ? data.detail : '');
+                        }
+                        reject(new Error(errorMsg));
+                    }
+                };
+
+                xhr.onerror = function () {
+                    reject(new Error('网络错误，上传失败。请检查网络连接后重试。'));
+                };
+
+                xhr.ontimeout = function () {
+                    reject(new Error('上传超时（30分钟）。请检查网络连接，或尝试上传较小的文件。'));
+                };
+
+                var fd = new FormData();
+                fd.append('kb_id', kbId);
+                fd.append('file', file, file.name);
+                xhr.send(fd);
+            });
         }
 
+<<<<<<< HEAD
+        // 页面加载时初始化
+        document.addEventListener('DOMContentLoaded', function() {
+            refreshKbListAndRender();
+            updateSendButton();
+
+            // 知识库文件上传监听
+            var kbFileInput = document.getElementById('kbFileInput');
+            if (kbFileInput) {
+                kbFileInput.addEventListener('change', async function (e) {
+                    var files = Array.from(e.target.files || []);
+                    e.target.value = '';
+                    if (!files.length) return;
+                    if (!kbUploadTargetId) {
+                        setStatus('请先选择知识库再上传');
+                        return;
+                    }
+
+                    // 1. 显示上传进度条并禁用上传按钮
+                    toggleUploadProgress(true);
+                    
+                    // 2. 检查文件大小限制（500MB）
+                    var MAX_FILE_SIZE_JS = 500 * 1024 * 1024; // 500MB
+                    var oversizedFiles = [];
+                    for (var j = 0; j < files.length; j++) {
+                        if (files[j].size > MAX_FILE_SIZE_JS) {
+                            oversizedFiles.push(files[j].name + ' (' + Math.round(files[j].size/(1024*1024)) + 'MB)');
+                        }
+                    }
+                    if (oversizedFiles.length > 0) {
+                        toggleUploadProgress(false);
+                        setStatus('以下文件超过500MB限制：' + oversizedFiles.join(', '));
+                        return;
+                    }
+
+                    // 3. 检查重复文件（基于文件名和文件大小）
+                    var duplicateFiles = [];
+                    var uniqueFiles = [];
+                    var seenFiles = new Map(); // 用于快速查找重复文件
+                    
+                    for (var j = 0; j < files.length; j++) {
+                        var file = files[j];
+                        var key = file.name + '|' + file.size + '|' + file.lastModified;
+                        
+                        if (seenFiles.has(key)) {
+                            duplicateFiles.push({
+                                name: file.name,
+                                size: formatFileSize(file.size)
+                            });
+                        } else {
+                            seenFiles.set(key, file);
+                            uniqueFiles.push(file);
+                        }
+                    }
+                    
+                    // 如果有重复文件，显示警告但不阻止上传
+                    if (duplicateFiles.length > 0) {
+                        var duplicateNames = duplicateFiles.map(f => f.name + ' (' + f.size + ')').join(', ');
+                        setStatus(`警告：发现 ${duplicateFiles.length} 个重复文件，将跳过上传: ${duplicateNames}`, 'warning');
+                    }
+                    
+                    // 如果没有有效文件，隐藏进度条并返回
+                    if (uniqueFiles.length === 0) {
+                        toggleUploadProgress(false);
+                        setStatus('没有有效文件可以上传（所有文件都是重复的）');
+                        return;
+                    }
+
+                    var total = uniqueFiles.length;
+                    var ok = 0;
+                    var failed = 0;
+                    var lastData = null;
+                    var completedFiles = []; // 跟踪已完成上传的文件
+                    
+                    try {
+                        // 更新进度条显示文件总数
+                        updateUploadProgress(0, `准备上传 ${total} 个文件`, '正在检查文件...');
+                        
+                        for (var i = 0; i < uniqueFiles.length; i++) {
+                            var f = uniqueFiles[i];
+                            var idx = i + 1;
+                            
+                            // 4. 检查文件是否已经在completedFiles列表中（防止重复多次点击）
+                            var isDupeInUpload = completedFiles.some(cf => 
+                                cf.name === f.name && cf.size === f.size && cf.lastModified === f.lastModified
+                            );
+                            
+                            if (isDupeInUpload) {
+                                setStatus(`跳过重复文件: ${f.name} (已在当前上传中)`, 'warning');
+                                continue;
+                            }
+                            
+                            // 显示文件大小信息
+                            updateUploadProgress(
+                                0,
+                                `准备上传 (${idx}/${total}): ${f.name}`,
+                                `${formatFileSize(f.size)} (总进度 ${ok}/${total})`
+                            );
+                            
+                            try {
+                                var data = await uploadKbFileWithProgress(kbUploadTargetId, f, idx, total);
+                                lastData = data;
+                                ok++;
+                                completedFiles.push({
+                                    name: f.name,
+                                    size: f.size,
+                                    lastModified: f.lastModified
+                                });
+                                
+                                // 等待知识库索引构建进度
+                                updateUploadProgress(
+                                    100,
+                                    `文件上传完成: ${f.name} (${ok}/${total})`,
+                                    '正在构建知识库索引...'
+                                );
+                                await waitKbRebuildProgress(kbUploadTargetId, true);
+                            } catch (fileError) {
+                                failed++;
+                                if (fileError.message && fileError.message.includes('已存在同名文件')) {
+                                    setStatus(`跳过重复文件: ${f.name} (已存在于知识库中)`, 'warning');
+                                } else {
+                                    setStatus(`文件上传失败: ${f.name} - ${fileError.message}`, 'error');
+                                }
+                            }
+                        }
+
+                        if (lastData && lastData.id) {
+                            selectedKbId = lastData.id;
+                            localStorage.setItem('kb_selected_id', selectedKbId);
+                        }
+                        await refreshKbListAndRender();
+                        
+                        // 显示最终结果
+                        var resultMessage = '';
+                        if (ok === total && failed === 0) {
+                            resultMessage = `知识库导入完成：全部 ${total} 个文件上传成功`;
+                            updateUploadProgress(100, resultMessage, '所有文件已成功上传并索引');
+                            setStatus(resultMessage, 'success');
+                        } else if (ok > 0) {
+                            resultMessage = `知识库导入完成：成功 ${ok}/${total}`;
+                            if (failed > 0) resultMessage += `，失败 ${failed} 个文件`;
+                            updateUploadProgress(ok / total * 100, resultMessage, '');
+                            setStatus(resultMessage, failed > 0 ? 'warning' : 'success');
+                        } else {
+                            resultMessage = '所有文件上传都失败了';
+                            updateUploadProgress(0, resultMessage, '请检查文件格式和网络连接');
+                            setStatus(resultMessage, 'error');
+                        }
+                    } catch (err) {
+                        await refreshKbListAndRender();
+                        var errorMsg = '知识库导入中断：已成功 ' + ok + ' / ' + total + '，原因：' + (err.message || err);
+                        setStatus(errorMsg, 'error');
+                        updateUploadProgress(ok / total * 100, '上传中断', errorMsg);
+                    } finally {
+                        // 延迟隐藏进度条，让用户看到完成状态
+                        setTimeout(() => toggleUploadProgress(false), 2000);
+                        kbUploadTargetId = null;
+                    }
+                });
+            }
+
+            refreshChatHistory();
+        });
+
+        // 其余JavaScript函数保持不变...
+        async function sendQuestion() {
+            const input = document.getElementById('questionInput');
+            const question = input.value.trim();
+            if (!question) return;
+            
+            const button = document.getElementById('sendButton');
+            button.disabled = true;
+            
+            // 添加用户消息
+            addMessage('user', question);
+            input.value = '';
+            updateSendButton();
+            
+            try {
+                const response = await fetch(apiUrl('/chat'), {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({
+                        question: question,
+                        attachment_text: attachments.join('\n'),
+                        kb_id: selectedKbId,
+                        selected_files: []
+                    })
+                });
+                
+                if (!response.ok) {
+                    const error = await response.json();
+                    throw new Error(error.detail || `HTTP ${response.status}`);
+                }
+                
+                const data = await response.json();
+                addMessage('bot', data.answer, data.contexts);
+            } catch (err) {
+                addMessage('bot', '抱歉，回答问题出错了：' + explainFetchError(err));
+                setStatus('请求失败：' + explainFetchError(err), 'error');
+            }
+            
+            button.disabled = false;
+        }
+
+        function handleKeydown(event) {
+            if (event.key === 'Enter' && !event.shiftKey) {
+                event.preventDefault();
+                sendQuestion();
+=======
         if (menuBtn) {
             menuBtn.addEventListener('click', function (e) {
                 e.preventDefault();
@@ -2622,9 +4093,352 @@ async def chat_ui() -> str:
         document.addEventListener('keydown', function (e) {
             if (e.key === 'Escape') {
                 closeHistoryDrawer();
+>>>>>>> origin/zhishiku
             }
+            updateSendButton();
+        }
+
+        function updateSendButton() {
+            const input = document.getElementById('questionInput');
+            const button = document.getElementById('sendButton');
+            button.disabled = !input.value.trim();
+        }
+
+        function addMessage(role, content, contexts = []) {
+            const history = document.getElementById('chatHistory');
+            const message = document.createElement('div');
+            message.className = `message ${role}-message`;
+            
+            const now = new Date();
+            const timeStr = now.toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' });
+            
+            message.innerHTML = `
+                <div class="message-header">
+                    <span>${role === 'user' ? '👤 你' : '🤖 AI助手'}</span>
+                    <span>${timeStr}</span>
+                </div>
+                <div class="message-content">${content.replace(/\n/g, '<br>')}</div>
+                ${contexts.length ? `
+                <div class="message-contexts">
+                    ${contexts.map(ctx => `
+                    <div class="context-item">
+                        <div class="context-source">${ctx.source}</div>
+                        <div class="context-preview">${ctx.text_preview}</div>
+                        <div class="context-score">相关度: ${ctx.score.toFixed(2)}</div>
+                    </div>
+                    `).join('')}
+                </div>
+                ` : ''}
+            `;
+            
+            history.appendChild(message);
+            history.scrollTop = history.scrollHeight;
+            
+            // 保存到本地存储
+            saveChatHistory();
+        }
+
+        function clearChat() {
+            if (!confirm('确定要清空对话历史吗？')) return;
+            const history = document.getElementById('chatHistory');
+            history.innerHTML = '';
+            attachments = [];
+            updateAttachments();
+            localStorage.removeItem('chat_history');
+            setStatus('对话历史已清空', 'success');
+        }
+
+        function refreshChatHistory() {
+            try {
+                const saved = localStorage.getItem('chat_history');
+                if (saved) {
+                    const history = JSON.parse(saved);
+                    history.forEach(item => addMessage(item.role, item.content, item.contexts || []));
+                }
+            } catch (e) {
+                console.error('加载对话历史失败:', e);
+            }
+        }
+
+        function saveChatHistory() {
+            const messages = [];
+            document.querySelectorAll('.message').forEach(msg => {
+                const role = msg.classList.contains('user-message') ? 'user' : 'bot';
+                const content = msg.querySelector('.message-content').textContent;
+                const contexts = [];
+                msg.querySelectorAll('.context-item').forEach(ctx => {
+                    contexts.push({
+                        source: ctx.querySelector('.context-source').textContent,
+                        text_preview: ctx.querySelector('.context-preview').textContent,
+                        score: parseFloat(ctx.querySelector('.context-score').textContent.replace('相关度: ', ''))
+                    });
+                });
+                messages.push({ role, content, contexts });
+            });
+            localStorage.setItem('chat_history', JSON.stringify(messages));
+        }
+
+        function uploadFile() {
+            document.getElementById('fileInput').click();
+        }
+
+        function uploadImage() {
+            document.getElementById('imageInput').click();
+        }
+
+        async function uploadFileHandler(file) {
+            try {
+                const formData = new FormData();
+                formData.append('file', file);
+                
+                const response = await fetch(apiUrl('/api/upload/file'), {
+                    method: 'POST',
+                    body: formData
+                });
+                
+                if (!response.ok) {
+                    const error = await response.json();
+                    throw new Error(error.detail || `HTTP ${response.status}`);
+                }
+                
+                const data = await response.json();
+                attachments.push(`【${file.name}】\n${data.text}`);
+                updateAttachments();
+                setStatus(`文件 "${file.name}" 上传成功，已提取文本`, 'success');
+            } catch (err) {
+                setStatus('文件上传失败: ' + explainFetchError(err), 'error');
+            }
+        }
+
+        async function uploadImageHandler(file) {
+            try {
+                const formData = new FormData();
+                formData.append('file', file);
+                
+                const response = await fetch(apiUrl('/api/ocr/image'), {
+                    method: 'POST',
+                    body: formData
+                });
+                
+                if (!response.ok) {
+                    const error = await response.json();
+                    throw new Error(error.detail || `HTTP ${response.status}`);
+                }
+                
+                const data = await response.json();
+                attachments.push(`【图片 ${file.name}】\n${data.text}`);
+                updateAttachments();
+                setStatus(`图片 "${file.name}" 识别成功`, 'success');
+            } catch (err) {
+                setStatus('图片识别失败: ' + explainFetchError(err), 'error');
+            }
+        }
+
+        function updateAttachments() {
+            const container = document.getElementById('attachments');
+            container.innerHTML = attachments.map((text, index) => `
+                <div class="attachment-item">
+                    <span>📎</span>
+                    <span>${text.split('】')[0].substring(1)}</span>
+                    <span class="remove-attachment" onclick="removeAttachment(${index})">×</span>
+                </div>
+            `).join('');
+        }
+
+        function removeAttachment(index) {
+            attachments.splice(index, 1);
+            updateAttachments();
+        }
+
+        document.getElementById('fileInput').addEventListener('change', function(e) {
+            const file = e.target.files[0];
+            if (file) uploadFileHandler(file);
+            e.target.value = '';
         });
 
+<<<<<<< HEAD
+        document.getElementById('imageInput').addEventListener('change', function(e) {
+            const file = e.target.files[0];
+            if (file) uploadImageHandler(file);
+            e.target.value = '';
+        });
+
+        function toggleKnowledgePanel() {
+            const panel = document.getElementById('knowledgePanel');
+            panel.style.display = panel.style.display === 'none' ? 'block' : 'none';
+            if (panel.style.display === 'block') {
+                refreshKbListAndRender();
+            }
+        }
+
+        async function refreshKbListAndRender() {
+            try {
+                const response = await fetch(apiUrl('/api/kb/list'));
+                if (!response.ok) throw new Error(`HTTP ${response.status}`);
+                const data = await response.json();
+                renderKnowledgeList(data.items);
+                
+                if (selectedKbId) {
+                    await refreshFileList(selectedKbId);
+                }
+            } catch (err) {
+                setStatus('加载知识库列表失败: ' + explainFetchError(err), 'error');
+            }
+        }
+
+        function renderKnowledgeList(items) {
+            const container = document.getElementById('knowledgeList');
+            container.innerHTML = items.map(kb => `
+                <div class="knowledge-item ${selectedKbId === kb.id ? 'active' : ''}" 
+                     onclick="selectKnowledgeBase('${kb.id}')">
+                    <div class="knowledge-name">${kb.name || '未命名知识库'}</div>
+                    <div class="knowledge-meta">
+                        <span>${kb.file_count} 文件</span>
+                        <span>${formatFileSize(kb.total_size)}</span>
+                    </div>
+                    <div class="knowledge-actions">
+                        <button class="btn" onclick="event.stopPropagation(); deleteKnowledgeBase('${kb.id}')" 
+                                style="flex: 1; padding: 4px 8px; font-size: 12px;">
+                            🗑️ 删除
+                        </button>
+                        <button class="btn" onclick="event.stopPropagation(); refreshFileList('${kb.id}')" 
+                                style="flex: 1; padding: 4px 8px; font-size: 12px;">
+                            🔄 刷新
+                        </button>
+                    </div>
+                </div>
+            `).join('');
+        }
+
+        function selectKnowledgeBase(kbId) {
+            selectedKbId = kbId;
+            localStorage.setItem('kb_selected_id', kbId);
+            kbUploadTargetId = kbId;
+            refreshKbListAndRender();
+            setStatus(`已选择知识库: ${getKbName(kbId)}`, 'success');
+        }
+
+        async function createKnowledgeBase() {
+            const input = document.getElementById('kbNameInput');
+            const name = input.value.trim();
+            if (!name) {
+                setStatus('请输入知识库名称', 'error');
+                return;
+            }
+            
+            try {
+                const formData = new FormData();
+                formData.append('name', name);
+                
+                const response = await fetch(apiUrl('/api/kb/create'), {
+                    method: 'POST',
+                    body: formData
+                });
+                
+                if (!response.ok) {
+                    const error = await response.json();
+                    throw new Error(error.detail || `HTTP ${response.status}`);
+                }
+                
+                const data = await response.json();
+                setStatus(`知识库 "${name}" 创建成功`, 'success');
+                input.value = '';
+                await refreshKbListAndRender();
+                selectKnowledgeBase(data.id);
+            } catch (err) {
+                setStatus('创建知识库失败: ' + explainFetchError(err), 'error');
+            }
+        }
+
+        async function deleteKnowledgeBase(kbId) {
+            if (!confirm('确定要删除这个知识库吗？这个操作无法撤销。')) return;
+            
+            try {
+                const response = await fetch(apiUrl('/api/kb/' + kbId), {
+                    method: 'DELETE'
+                });
+                
+                if (!response.ok) {
+                    const error = await response.json();
+                    throw new Error(error.detail || `HTTP ${response.status}`);
+                }
+                
+                setStatus('知识库删除成功', 'success');
+                if (selectedKbId === kbId) {
+                    selectedKbId = null;
+                    localStorage.removeItem('kb_selected_id');
+                }
+                await refreshKbListAndRender();
+            } catch (err) {
+                setStatus('删除知识库失败: ' + explainFetchError(err), 'error');
+            }
+        }
+
+        async function refreshFileList(kbId) {
+            try {
+                const response = await fetch(apiUrl('/api/kb/' + kbId + '/files'));
+                if (!response.ok) throw new Error(`HTTP ${response.status}`);
+                const data = await response.json();
+                renderFileList(data.items);
+            } catch (err) {
+                // setStatus('加载文件列表失败: ' + explainFetchError(err), 'error');
+            }
+        }
+
+        function renderFileList(items) {
+            const container = document.getElementById('fileList');
+            container.innerHTML = items.length ? items.map(file => `
+                <div class="file-item">
+                    <div class="file-name">${file.name}</div>
+                    <div class="file-size">${formatFileSize(file.size)}</div>
+                </div>
+            `).join('') : '<div style="text-align: center; color: var(--text-muted); padding: 20px;">暂无文件</div>';
+        }
+
+        async function waitKbRebuildProgress(kbId, showProgress = false) {
+            let attempt = 0;
+            while (attempt < 60) { // 最多等待5分钟
+                try {
+                    const response = await fetch(apiUrl('/api/kb/' + kbId + '/index_progress'));
+                    if (!response.ok) break;
+                    const data = await response.json();
+                    
+                    if (showProgress && !data.done) {
+                        const percent = data.total_chunks ? Math.round((data.processed_chunks / data.total_chunks) * 100) : 0;
+                        setStatus(`知识库索引构建中: ${percent}% (${data.message})`, 'info');
+                    }
+                    
+                    if (data.done) {
+                        if (showProgress) setStatus('知识库索引构建完成', 'success');
+                        break;
+                    }
+                } catch (err) {
+                    // 忽略错误，继续等待
+                }
+                
+                await new Promise(resolve => setTimeout(resolve, 5000)); // 5秒检查一次
+                attempt++;
+            }
+        }
+
+        function getKbName(kbId) {
+            if (kbId === 'legacy_fire') return '消防';
+            const item = document.querySelector(`.knowledge-item[onclick*="${kbId}"]`);
+            return item ? item.querySelector('.knowledge-name').textContent : '未知知识库';
+        }
+
+        function formatFileSize(bytes) {
+            if (bytes === 0) return '0 B';
+            const k = 1024;
+            const sizes = ['B', 'KB', 'MB', 'GB'];
+            const i = Math.floor(Math.log(bytes) / Math.log(k));
+            return parseFloat((bytes / Math.pow(k, i)).toFixed(1)) + ' ' + sizes[i];
+        }
+    </script>
+</body>
+</html>"""
+    return HTMLResponse(content=html_content, status_code=200)
+=======
         if (sendBtn) {
             sendBtn.addEventListener('click', function (e) {
                 e.preventDefault();
@@ -2751,8 +4565,6 @@ def _effective_rag_query(question: str, attachment_text: str) -> str:
 
 
 @app.post("/chat", response_model=ChatResponse)
-@timed(name="聊天接口")
-@cached(ttl=60)  # 缓存1分钟，相同的查询可以快速返回
 async def chat(body: ChatRequest) -> ChatResponse:
     """核心聊天接口：接收问题，返回回答和参考片段。"""
     q = (body.question or "").strip()
@@ -2795,4 +4607,8 @@ async def chat(body: ChatRequest) -> ChatResponse:
         )
 
     return ChatResponse(answer=answer, contexts=contexts)
+>>>>>>> origin/zhishiku
 
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8001)
