@@ -41,7 +41,7 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 # 新上传系统导入
 from upload_api import router as upload_router, init_upload_system
 import numpy as np
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from config import settings
 from rag_service import load_index, rag_answer, rag_answer_filtered
@@ -2138,6 +2138,23 @@ async def chat_ui() -> str:
             }
         }
 
+        function updateSessionTitle(id, newTitle) {
+            var all = loadAllSessionsFromStorage();
+            for (var i = 0; i < all.length; i++) {
+                if (all[i].id === id) {
+                    all[i].title = newTitle;
+                    all[i].updatedAt = Date.now();
+                    break;
+                }
+            }
+            saveAllSessionsToStorage(all);
+            // 如果是当前会话，也更新内存中的标题
+            if (id === currentSessionId) {
+                var titleEl = document.getElementById('currentSessionTitle');
+                if (titleEl) titleEl.textContent = newTitle;
+            }
+        }
+
         function deleteHistorySession(id) {
             if (!confirm('确定删除这条历史对话？此操作不可恢复。')) return;
             var all = loadAllSessionsFromStorage();
@@ -2479,6 +2496,25 @@ async def chat_ui() -> str:
             chatInFlight = true;
             setSendBtnBusy(true);
             setStatus('检索中');
+
+            // 调用总结API更新历史标题
+            let summaryUpdated = false;
+            try {
+                const summaryResp = await fetch(apiUrl('/api/summarize'), {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ question: q })
+                });
+                if (summaryResp.ok) {
+                    const summaryData = await summaryResp.json();
+                    if (summaryData.summary && currentSessionId) {
+                        updateSessionTitle(currentSessionId, summaryData.summary);
+                        summaryUpdated = true;
+                    }
+                }
+            } catch (e) {
+                // 忽略总结API的错误，不影响主流程
+            }
 
             try {
                 let resp;
@@ -2955,4 +2991,60 @@ async def chat(body: ChatRequest) -> ChatResponse:
         )
 
     return ChatResponse(answer=answer, contexts=contexts)
+
+
+class SummarizeRequest(BaseModel):
+    """问题总结请求"""
+    question: str = Field(..., description="用户问题")
+
+
+class SummarizeResponse(BaseModel):
+    """问题总结响应"""
+    summary: str = Field(..., description="总结后的标题")
+
+
+@app.post("/api/summarize", response_model=SummarizeResponse)
+@timed(name="问题总结接口")
+async def summarize_question(body: SummarizeRequest) -> SummarizeResponse:
+    """将用户问题总结为简洁的标题"""
+    q = (body.question or "").strip()
+    if not q:
+        return SummarizeResponse(summary="新对话")
+
+    try:
+        # 调用通义千问API进行总结
+        from config import settings
+        import dashscope
+        dashscope.api_key = settings.dashscope_api_key
+
+        prompt = f"""请将下面的用户问题总结为一个简洁的中文标题（不超过20个字），只返回标题，不要加引号或其他符号：
+
+问题：{q}
+
+标题："""
+
+        response = dashscope.Generation.call(
+            model=dashscope.Generation.Models.qwen_turbo,
+            prompt=prompt,
+            max_tokens=50,
+            temperature=0.3,
+            result_format='message',
+        )
+
+        if response.status_code == 200:
+            summary = response.output.choices[0].message.content.strip()
+            # 清理标题：移除可能的引号和空白
+            summary = summary.strip('"\'。').strip()
+            if len(summary) > 20:
+                summary = summary[:20] + "…"
+            return SummarizeResponse(summary=summary)
+        else:
+            # API调用失败，使用默认逻辑
+            summary = q[:20] + "…" if len(q) > 20 else q
+            return SummarizeResponse(summary=summary)
+
+    except Exception as e:
+        # 出错时使用默认逻辑
+        summary = q[:20] + "…" if len(q) > 20 else q
+        return SummarizeResponse(summary=summary)
 
