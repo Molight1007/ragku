@@ -1,0 +1,15 @@
+{
+  "session_id": "882caf88-29b1-46cb-beab-4715399564b1",
+  "kb_id": "test_kb",
+  "filename": "test.txt",
+  "file_size": 11,
+  "total_chunks": 1,
+  "md5_hash": "",
+  "uploaded_chunks": {
+    "0": false
+  },
+  "chunk_hashes": {},
+  "chunk_files": {},
+  "created_at": "2026-04-11T20:07:47.563785",
+  "last_activity": "2026-04-11T20:07:47.563786"
+}
