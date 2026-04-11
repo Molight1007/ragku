@@ -25,6 +25,7 @@ def timed(func: Callable = None, *, name: str = None, log_level: str = "info"):
     
     func_name = name or func.__name__
     
+    @functools.wraps(func)
     def sync_wrapper(*args, **kwargs):
         start_time = time.perf_counter()
         try:
@@ -35,6 +36,7 @@ def timed(func: Callable = None, *, name: str = None, log_level: str = "info"):
             log_func = getattr(logger, log_level, logger.info)
             log_func(f"[性能监控] {func_name} 执行时间: {elapsed:.4f}秒")
     
+    @functools.wraps(func)
     async def async_wrapper(*args, **kwargs):
         start_time = time.perf_counter()
         try:
@@ -110,6 +112,7 @@ def cached(func: Callable = None, *, ttl: int = 300, key_prefix: str = None):
     
     func_name = key_prefix or func.__name__
     
+    @functools.wraps(func)
     def sync_wrapper(*args, **kwargs):
         cache_key = cache._generate_key(func_name, *args, **kwargs)
         cached_value = cache.get(cache_key)
@@ -121,6 +124,7 @@ def cached(func: Callable = None, *, ttl: int = 300, key_prefix: str = None):
         cache.set(cache_key, result, ttl=ttl)
         return result
     
+    @functools.wraps(func)
     async def async_wrapper(*args, **kwargs):
         cache_key = cache._generate_key(func_name, *args, **kwargs)
         cached_value = cache.get(cache_key)

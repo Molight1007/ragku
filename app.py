@@ -47,6 +47,7 @@ from config import settings
 from rag_service import load_index, rag_answer, rag_answer_filtered
 
 MAX_UPLOAD_BYTES = 15 * 1024 * 1024
+MAX_FILE_SIZE = 15 * 1024 * 1024  # 15MB
 LEGACY_KB_ID = "legacy_fire"
 LEGACY_KB_NAME = "消防"
 UPLOAD_DIR = Path(__file__).resolve().parent / "uploads"

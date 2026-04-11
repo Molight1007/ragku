@@ -639,17 +639,18 @@ async def _save_upload_file(kb_id: str, file: UploadFile) -> Tuple[bool, str, st
         return False, str(e), ""
 
 
-@router.post("/upload/file", response_model=CompleteUploadResponse)
-async def upload_file_complete(
-    kb_id: str = Form(...),
-    file: UploadFile = File(...),
-    priority: str = Form("normal"),
-    upload_manager: ChunkedUploadManager = Depends(get_upload_manager),
-    vectorization_queue: VectorizationQueue = Depends(get_vectorization_queue_instance),
-    persistence: UploadPersistence = Depends(get_persistence_instance)
+
+
+async def _upload_file_complete_internal(
+    kb_id: str,
+    file: UploadFile,
+    priority: str,
+    upload_manager: ChunkedUploadManager,
+    vectorization_queue: VectorizationQueue,
+    persistence: UploadPersistence
 ):
     """
-    一站式文件上传API
+    一站式文件上传API内部实现
     
     结合分块上传和向量化，返回完整的结果
     """
@@ -695,6 +696,48 @@ async def upload_file_complete(
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"文件上传失败: {str(e)}")
+
+
+async def upload_file_complete(
+    kb_id: str = Form(...),
+    file: UploadFile = File(...),
+    priority: str = Form("normal"),
+    upload_manager: ChunkedUploadManager = Depends(get_upload_manager),
+    vectorization_queue: VectorizationQueue = Depends(get_vectorization_queue_instance),
+    persistence: UploadPersistence = Depends(get_persistence_instance)
+):
+    """
+    一站式文件上传API（FastAPI路由使用）
+    
+    结合分块上传和向量化，返回完整的结果
+    """
+    # 处理直接调用时 Depends 对象无法解析的问题
+    from fastapi.params import Depends as FastAPIDepends
+    
+    actual_upload_manager = upload_manager
+    actual_vectorization_queue = vectorization_queue
+    actual_persistence = persistence
+    
+    # 如果参数是 Depends 对象，说明是直接调用，需要手动获取依赖
+    try:
+        if type(actual_upload_manager).__name__ == 'Depends':
+            actual_upload_manager = get_upload_manager()
+        if type(actual_vectorization_queue).__name__ == 'Depends':
+            actual_vectorization_queue = get_vectorization_queue_instance()
+        if type(actual_persistence).__name__ == 'Depends':
+            actual_persistence = get_persistence_instance()
+    except TypeError:
+        # 在 FastAPI 路由调用时，这些参数已经被正确解析
+        pass
+    
+    return await _upload_file_complete_internal(
+        kb_id=kb_id,
+        file=file,
+        priority=priority,
+        upload_manager=actual_upload_manager,
+        vectorization_queue=actual_vectorization_queue,
+        persistence=actual_persistence
+    )
 
 
 @router.post("/upload/batch", response_model=BatchUploadResponse)
