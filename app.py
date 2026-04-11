@@ -500,6 +500,128 @@ async def api_kb_upload(
         raise HTTPException(status_code=500, detail=f"文件上传失败: {str(e)}")
 
 
+class BatchUploadResponse(BaseModel):
+    """批量上传响应"""
+    kb_id: str
+    kb_name: str
+    total_files: int
+    success_count: int
+    failed_files: List[str]
+    message: str
+
+
+@app.post("/api/kb/upload/batch", response_model=BatchUploadResponse)
+@timed(name="批量上传接口")
+async def api_kb_upload_batch(
+    kb_id: str = Form(...),
+    files: List[UploadFile] = File(..., max_length=MAX_FILE_SIZE)
+) -> BatchUploadResponse:
+    """批量上传多个文件到知识库，统一向量化"""
+    from upload_api import upload_file_complete
+    
+    safe_id = _safe_kb_id(kb_id)
+    success_count = 0
+    failed_files: List[str] = []
+    
+    try:
+        # 并行上传所有文件
+        async def upload_single(file: UploadFile) -> Tuple[bool, str]:
+            try:
+                result = await upload_file_complete(
+                    kb_id=kb_id,
+                    file=file,
+                    priority="normal"
+                )
+                if result.success:
+                    return True, file.filename
+                else:
+                    return False, f"{file.filename}: {result.message}"
+            except Exception as e:
+                return False, f"{file.filename}: {str(e)}"
+        
+        # 使用asyncio.gather并行上传
+        results = await asyncio.gather(*[upload_single(f) for f in files], return_exceptions=True)
+        
+        for r in results:
+            if isinstance(r, Exception):
+                failed_files.append(f"异常: {str(r)}")
+            elif isinstance(r, tuple):
+                success, msg = r
+                if success:
+                    success_count += 1
+                else:
+                    failed_files.append(msg)
+        
+        # 获取知识库信息
+        files_dir = _kb_files_dir(kb_id)
+        kb_name = "未知"
+        name_file = _kb_name_file(kb_id)
+        if name_file.exists():
+            try:
+                kb_name = name_file.read_text(encoding="utf-8").strip()
+            except:
+                pass
+        
+        # 启动统一向量化任务（只启动一次）
+        KB_REBUILD_RUNNING.add(safe_id)
+        KB_UPLOAD_PROGRESS[safe_id] = {
+            "total": 1,
+            "processed": 0,
+            "done": False,
+            "message": f"已上传 {success_count} 个文件，正在重建索引...",
+        }
+
+        async def _rebuild() -> None:
+            try:
+                docs = await asyncio.to_thread(_collect_documents_for_kb, files_dir)
+                if not docs:
+                    with KB_UPLOAD_LOCK:
+                        KB_UPLOAD_PROGRESS[safe_id] = {
+                            "total": 0,
+                            "processed": 0,
+                            "done": True,
+                            "message": "知识库未提取到可向量化文本",
+                        }
+                    return
+                embeddings, metadatas = await asyncio.to_thread(_build_embeddings_for_kb_with_progress, docs, safe_id)
+                await asyncio.to_thread(np.save, _kb_index_file(safe_id), embeddings)
+                await asyncio.to_thread(np.save, _kb_meta_file(safe_id), np.array(metadatas, dtype=object))
+                with KB_UPLOAD_LOCK:
+                    p = KB_UPLOAD_PROGRESS.get(safe_id, {})
+                    p["done"] = True
+                    p["message"] = f"索引重建完成 ({len(docs)} 个分片)"
+                    KB_UPLOAD_PROGRESS[safe_id] = p
+            except Exception as e:
+                with KB_UPLOAD_LOCK:
+                    p = KB_UPLOAD_PROGRESS.get(safe_id, {"total": 0, "processed": 0})
+                    p["done"] = True
+                    p["message"] = f"索引重建失败: {e}"
+                    KB_UPLOAD_PROGRESS[safe_id] = p
+            finally:
+                with KB_UPLOAD_LOCK:
+                    KB_REBUILD_RUNNING.discard(safe_id)
+
+        asyncio.create_task(_rebuild())
+        
+        message = f"成功上传 {success_count}/{len(files)} 个文件"
+        if failed_files:
+            message += f"，{len(failed_files)} 个失败"
+        
+        return BatchUploadResponse(
+            kb_id=kb_id,
+            kb_name=kb_name,
+            total_files=len(files),
+            success_count=success_count,
+            failed_files=failed_files,
+            message=message
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"批量上传失败: {str(e)}")
+
+
 @app.get("/api/kb/{kb_id}/progress", response_model=KnowledgeBaseUploadProgress)
 async def api_kb_progress(kb_id: str) -> KnowledgeBaseUploadProgress:
     safe_id = _safe_kb_id(kb_id)
@@ -2574,6 +2696,48 @@ async def chat_ui() -> str:
             }
         }
 
+        // 并行上传多个文件（使用批量上传API）
+        async function uploadFilesBatch(kbId, files) {
+            return new Promise(function (resolve, reject) {
+                var xhr = new XMLHttpRequest();
+                xhr.open('POST', apiUrl('/api/kb/upload/batch'));
+                xhr.responseType = 'json';
+
+                xhr.upload.onprogress = function (evt) {
+                    if (evt.lengthComputable && evt.total > 0) {
+                        var p = Math.round((evt.loaded / evt.total) * 100);
+                        setStatus('上传中（' + files.length + '个文件）：' + p + '%');
+                    } else {
+                        setStatus('上传中（' + files.length + '个文件）...');
+                    }
+                };
+
+                xhr.onload = function () {
+                    var data = xhr.response;
+                    if (!data && xhr.responseText) {
+                        try { data = JSON.parse(xhr.responseText); } catch (e) {}
+                    }
+                    if (xhr.status >= 200 && xhr.status < 300) {
+                        resolve(data || {});
+                    } else {
+                        reject(new Error((data && data.detail) ? data.detail : ('HTTP ' + xhr.status)));
+                    }
+                };
+
+                xhr.onerror = function () {
+                    reject(new Error('网络错误，上传失败'));
+                };
+
+                var fd = new FormData();
+                fd.append('kb_id', kbId);
+                // 添加所有文件
+                for (var i = 0; i < files.length; i++) {
+                    fd.append('files', files[i], files[i].name);
+                }
+                xhr.send(fd);
+            });
+        }
+
         if (kbFileInput) {
             kbFileInput.addEventListener('change', async function (e) {
                 var files = Array.from(e.target.files || []);
@@ -2585,28 +2749,25 @@ async def chat_ui() -> str:
                 }
 
                 var total = files.length;
-                var ok = 0;
-                var lastData = null;
                 try {
-                    for (var i = 0; i < files.length; i++) {
-                        var f = files[i];
-                        var idx = i + 1;
-                        setStatus('准备上传（' + idx + '/' + total + '）：' + f.name);
-                        var data = await uploadKbFileWithProgress(kbUploadTargetId, f, idx, total);
-                        lastData = data;
-                        ok++;
-                        await waitKbRebuildProgress(kbUploadTargetId, true);
-                    }
-
-                    if (lastData && lastData.id) {
-                        selectedKbId = lastData.id;
+                    setStatus('开始上传 ' + total + ' 个文件（并行）...');
+                    
+                    // 使用批量上传API
+                    var result = await uploadFilesBatch(kbUploadTargetId, files);
+                    
+                    // 等待向量化完成
+                    if (result.kb_id) {
+                        selectedKbId = result.kb_id;
                         localStorage.setItem(KB_SELECTED_KEY, selectedKbId);
+                        setStatus(result.message || '文件上传成功，正在处理...');
+                        await waitKbRebuildProgress(result.kb_id, true);
                     }
+                    
                     await refreshKbListAndRender();
-                    setStatus('知识库导入完成：成功 ' + ok + ' / ' + total);
+                    setStatus(result.message || '知识库导入完成');
                 } catch (err) {
                     await refreshKbListAndRender();
-                    setStatus('知识库导入中断：已成功 ' + ok + ' / ' + total + '，原因：' + (err.message || err));
+                    setStatus('知识库导入失败：' + (err.message || err));
                 } finally {
                     kbUploadTargetId = null;
                 }

@@ -19,7 +19,7 @@ import uuid
 from datetime import datetime
 from enum import Enum
 from pathlib import Path
-from typing import Dict, List, Optional, Any
+from typing import Dict, List, Optional, Any, Tuple
 from fastapi import APIRouter, File, Form, HTTPException, UploadFile, Depends
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
@@ -143,9 +143,11 @@ class BatchUploadRequest(BaseModel):
 
 class BatchUploadResponse(BaseModel):
     """批量上传响应"""
-    upload_session_ids: List[str] = Field(..., description="上传会话ID列表")
-    vectorization_task_ids: List[str] = Field(..., description="向量化任务ID列表")
-    failed_files: List[Dict[str, Any]] = Field(..., description="失败的文件信息")
+    session_id: str = Field(default="", description="会话ID")
+    success: bool = Field(default=True, description="是否成功")
+    message: str = Field(default="", description="消息")
+    uploaded_files: int = Field(default=0, description="成功上传的文件数")
+    failed_files: List[str] = Field(default_factory=list, description="失败的文件列表")
 
 class ResumeUploadRequest(BaseModel):
     """恢复上传请求"""
@@ -595,25 +597,12 @@ async def cancel_vectorization_task(
 
 # ====== 综合文件上传API ======
 
-@router.post("/upload/file", response_model=CompleteUploadResponse)
-async def upload_file_complete(
-    kb_id: str = Form(...),
-    file: UploadFile = File(...),
-    priority: str = Form("normal"),
-    upload_manager: ChunkedUploadManager = Depends(get_upload_manager),
-    vectorization_queue: VectorizationQueue = Depends(get_vectorization_queue_instance),
-    persistence: UploadPersistence = Depends(get_persistence_instance)
-):
-    """
-    一站式文件上传API
-    
-    结合分块上传和向量化，返回完整的结果
-    """
+async def _save_upload_file(kb_id: str, file: UploadFile) -> Tuple[bool, str, str]:
+    """保存单个上传文件，返回 (success, file_path_or_error, file_id)"""
     try:
         # 保存文件到临时位置
         import tempfile
         with tempfile.NamedTemporaryFile(delete=False, suffix=file.filename) as tmp_file:
-            # 流式写入
             chunk_size = 16 * 1024 * 1024  # 16MB
             file_size = 0
             
@@ -622,14 +611,6 @@ async def upload_file_complete(
                 file_size += len(chunk)
             
             temp_path = Path(tmp_file.name)
-        
-        # 创建上传会话（跳过分块，直接使用完整文件）
-        session = upload_manager.create_session(
-            kb_id=kb_id,
-            filename=file.filename,
-            file_size=file_size,
-            md5_hash=""
-        )
         
         # 保存文件到知识库（与app.py保持一致的路径）
         kb_root = Path(__file__).resolve().parent / "uploads" / "knowledge_bases"
@@ -653,36 +634,132 @@ async def upload_file_complete(
         file_hash = hashlib.md5(target_path.read_bytes()).hexdigest()
         file_id = hashlib.md5(f"{kb_id}:{file.filename}:{file_size}:{file_hash}".encode()).hexdigest()
         
+        return True, str(target_path), file_id
+    except Exception as e:
+        return False, str(e), ""
+
+
+@router.post("/upload/file", response_model=CompleteUploadResponse)
+async def upload_file_complete(
+    kb_id: str = Form(...),
+    file: UploadFile = File(...),
+    priority: str = Form("normal"),
+    upload_manager: ChunkedUploadManager = Depends(get_upload_manager),
+    vectorization_queue: VectorizationQueue = Depends(get_vectorization_queue_instance),
+    persistence: UploadPersistence = Depends(get_persistence_instance)
+):
+    """
+    一站式文件上传API
+    
+    结合分块上传和向量化，返回完整的结果
+    """
+    try:
+        success, result, file_id = await _save_upload_file(kb_id, file)
+        
+        if not success:
+            raise HTTPException(status_code=500, detail=f"文件上传失败: {result}")
+        
+        # 创建上传会话
+        session = upload_manager.create_session(
+            kb_id=kb_id,
+            filename=file.filename,
+            file_size=file.size if hasattr(file, 'size') else 0,
+            md5_hash=""
+        )
+        
         # 保存文件元数据
         metadata = {
             "file_id": file_id,
             "kb_id": kb_id,
-            "filename": final_filename,
+            "filename": Path(result).name,
             "original_name": file.filename,
-            "file_size": target_path.stat().st_size,
-            "file_hash": file_hash,
+            "file_size": Path(result).stat().st_size if Path(result).exists() else 0,
+            "file_hash": hashlib.md5(Path(result).read_bytes()).hexdigest() if Path(result).exists() else "",
             "upload_session_id": session.session_id,
-            "file_path": str(target_path),
+            "file_path": result,
             "created_at": datetime.now()
         }
         
         persistence.save_file_metadata(file_id, metadata)
         
-        # 创建向量化任务
-        # TODO: 暂时跳过向量化任务创建
-        task_id = None
-        
         return CompleteUploadResponse(
             session_id=session.session_id,
             success=True,
             message="文件上传成功",
-            file_path=str(target_path),
+            file_path=result,
             file_id=file_id,
-            vectorization_task_id=task_id
+            vectorization_task_id=None
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"文件上传失败: {str(e)}")
+
+
+@router.post("/upload/batch", response_model=BatchUploadResponse)
+async def upload_batch_files(
+    kb_id: str = Form(...),
+    files: List[UploadFile] = File(...),
+    priority: str = Form("normal"),
+    upload_manager: ChunkedUploadManager = Depends(get_upload_manager),
+    persistence: UploadPersistence = Depends(get_persistence_instance)
+):
+    """
+    批量上传多个文件
+    
+    支持同时上传多个文件，提高效率
+    """
+    try:
+        success_count = 0
+        failed_files = []
+        file_ids = []
+        
+        # 并行保存所有文件
+        results = await asyncio.gather(
+            *[_save_upload_file(kb_id, f) for f in files],
+            return_exceptions=True
+        )
+        
+        for i, r in enumerate(results):
+            if isinstance(r, Exception):
+                failed_files.append(f"{files[i].filename}: {str(r)}")
+            else:
+                success, result, file_id = r
+                if success:
+                    success_count += 1
+                    file_ids.append(file_id)
+                    
+                    # 保存元数据
+                    metadata = {
+                        "file_id": file_id,
+                        "kb_id": kb_id,
+                        "filename": Path(result).name,
+                        "original_name": files[i].filename,
+                        "file_size": Path(result).stat().st_size if Path(result).exists() else 0,
+                        "file_hash": hashlib.md5(Path(result).read_bytes()).hexdigest() if Path(result).exists() else "",
+                        "file_path": result,
+                        "created_at": datetime.now()
+                    }
+                    persistence.save_file_metadata(file_id, metadata)
+                else:
+                    failed_files.append(f"{files[i].filename}: {result}")
+        
+        message = f"成功上传 {success_count}/{len(files)} 个文件"
+        if failed_files:
+            message += f"，{len(failed_files)} 个失败"
+        
+        return BatchUploadResponse(
+            session_id=hashlib.md5(str(datetime.now()).encode()).hexdigest()[:12],
+            success=success_count > 0,
+            message=message,
+            uploaded_files=success_count,
+            failed_files=failed_files
         )
         
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"文件上传失败: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"批量上传失败: {str(e)}")
+
 
 @router.post("/upload/batch", response_model=BatchUploadResponse)
 async def batch_upload(
