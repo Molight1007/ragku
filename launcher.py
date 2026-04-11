@@ -15,12 +15,22 @@ from tkinter import filedialog, messagebox
 
 
 def _app_base_dir() -> Path:
+    """获取应用基础目录"""
     if getattr(sys, "frozen", False) and hasattr(sys, "executable"):
+        # 打包后：EXE所在目录（用户数据放这里）
         return Path(sys.executable).resolve().parent
     return Path(__file__).resolve().parent
 
 
+def _internal_dir() -> Path:
+    """获取内部代码目录（打包后是_internal目录）"""
+    if getattr(sys, "frozen", False) and hasattr(sys, "executable"):
+        return Path(sys.executable).resolve().parent / "_internal"
+    return Path(__file__).resolve().parent
+
+
 APP_DIR = _app_base_dir()
+INTERNAL_DIR = _internal_dir()
 ENV_FILE = APP_DIR / ".env"
 INDEX_STORE = APP_DIR / "index_store.npy"
 INDEX_META = APP_DIR / "index_meta.npy"
