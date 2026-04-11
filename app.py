@@ -445,6 +445,48 @@ async def api_kb_upload(
             except:
                 pass
         
+        # 启动向量化任务
+        safe_id = _safe_kb_id(kb_id)
+        KB_REBUILD_RUNNING.add(safe_id)
+        KB_UPLOAD_PROGRESS[safe_id] = {
+            "total": 1,
+            "processed": 0,
+            "done": False,
+            "message": "文件已上传，等待重建索引",
+        }
+
+        async def _rebuild() -> None:
+            try:
+                docs = await asyncio.to_thread(_collect_documents_for_kb, files_dir)
+                if not docs:
+                    with KB_UPLOAD_LOCK:
+                        KB_UPLOAD_PROGRESS[safe_id] = {
+                            "total": 0,
+                            "processed": 0,
+                            "done": True,
+                            "message": "知识库未提取到可向量化文本",
+                        }
+                    return
+                embeddings, metadatas = await asyncio.to_thread(_build_embeddings_for_kb_with_progress, docs, safe_id)
+                await asyncio.to_thread(np.save, _kb_index_file(safe_id), embeddings)
+                await asyncio.to_thread(np.save, _kb_meta_file(safe_id), np.array(metadatas, dtype=object))
+                with KB_UPLOAD_LOCK:
+                    p = KB_UPLOAD_PROGRESS.get(safe_id, {})
+                    p["done"] = True
+                    p["message"] = "索引重建完成"
+                    KB_UPLOAD_PROGRESS[safe_id] = p
+            except Exception as e:  # noqa: BLE001
+                with KB_UPLOAD_LOCK:
+                    p = KB_UPLOAD_PROGRESS.get(safe_id, {"total": 0, "processed": 0})
+                    p["done"] = True
+                    p["message"] = f"索引重建失败: {e}"
+                    KB_UPLOAD_PROGRESS[safe_id] = p
+            finally:
+                with KB_UPLOAD_LOCK:
+                    KB_REBUILD_RUNNING.discard(safe_id)
+
+        asyncio.create_task(_rebuild())
+        
         return KnowledgeBaseInfo(
             id=kb_id,
             name=kb_name,
@@ -456,50 +498,6 @@ async def api_kb_upload(
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"文件上传失败: {str(e)}")
-
-        KB_REBUILD_RUNNING.add(safe_id)
-        KB_UPLOAD_PROGRESS[safe_id] = {
-            "total": 1,
-            "processed": 0,
-            "done": False,
-            "message": "文件已上传，等待重建索引",
-        }
-
-    async def _rebuild() -> None:
-        try:
-            docs = await asyncio.to_thread(_collect_documents_for_kb, files_dir)
-            if not docs:
-                with KB_UPLOAD_LOCK:
-                    KB_UPLOAD_PROGRESS[safe_id] = {
-                        "total": 0,
-                        "processed": 0,
-                        "done": True,
-                        "message": "知识库未提取到可向量化文本",
-                    }
-                return
-            embeddings, metadatas = await asyncio.to_thread(_build_embeddings_for_kb_with_progress, docs, safe_id)
-            await asyncio.to_thread(np.save, _kb_index_file(safe_id), embeddings)
-            await asyncio.to_thread(np.save, _kb_meta_file(safe_id), np.array(metadatas, dtype=object))
-            with KB_UPLOAD_LOCK:
-                p = KB_UPLOAD_PROGRESS.get(safe_id, {})
-                p["done"] = True
-                p["message"] = "索引重建完成"
-                KB_UPLOAD_PROGRESS[safe_id] = p
-        except Exception as e:  # noqa: BLE001
-            with KB_UPLOAD_LOCK:
-                p = KB_UPLOAD_PROGRESS.get(safe_id, {"total": 0, "processed": 0})
-                p["done"] = True
-                p["message"] = f"索引重建失败: {e}"
-                KB_UPLOAD_PROGRESS[safe_id] = p
-        finally:
-            with KB_UPLOAD_LOCK:
-                KB_REBUILD_RUNNING.discard(safe_id)
-
-    asyncio.create_task(_rebuild())
-
-    kb_name = _kb_name_file(safe_id).read_text(encoding="utf-8", errors="ignore").strip() or safe_id
-    file_count = len([x for x in files_dir.rglob("*") if x.is_file()])
-    return KnowledgeBaseInfo(id=safe_id, name=kb_name, file_count=file_count)
 
 
 @app.get("/api/kb/{kb_id}/progress", response_model=KnowledgeBaseUploadProgress)
