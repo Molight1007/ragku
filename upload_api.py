@@ -188,10 +188,12 @@ async def create_upload_session(
     用于上传大文件，支持断点续传和并行上传
     """
     try:
-        # 验证知识库是否存在（简化验证，实际应调用现有API）
-        kb_dir = Path("knowledge") / request.kb_id
-        if not kb_dir.exists():
-            raise HTTPException(status_code=404, detail="知识库不存在")
+        # 验证知识库目录路径（与app.py保持一致）
+        from pathlib import Path as AppPath
+        kb_root = AppPath(__file__).resolve().parent / "uploads" / "knowledge_bases"
+        kb_dir = kb_root / request.kb_id
+        # 确保目录存在
+        kb_dir.mkdir(parents=True, exist_ok=True)
         
         # 验证文件大小
         if request.file_size <= 0:
@@ -328,8 +330,9 @@ async def complete_upload(
         if not session.is_complete():
             raise HTTPException(status_code=400, detail="文件上传未完成，无法进行组装")
         
-        # 组装文件
-        kb_dir = Path("knowledge") / session.kb_id
+        # 组装文件（与app.py保持一致的路径）
+        kb_root = Path(__file__).resolve().parent / "uploads" / "knowledge_bases"
+        kb_dir = kb_root / session.kb_id
         kb_dir.mkdir(parents=True, exist_ok=True)
         
         files_dir = kb_dir / "files"
@@ -628,8 +631,9 @@ async def upload_file_complete(
             md5_hash=""
         )
         
-        # 保存文件到知识库
-        kb_dir = Path("knowledge") / kb_id
+        # 保存文件到知识库（与app.py保持一致的路径）
+        kb_root = Path(__file__).resolve().parent / "uploads" / "knowledge_bases"
+        kb_dir = kb_root / kb_id
         kb_dir.mkdir(parents=True, exist_ok=True)
         
         files_dir = kb_dir / "files"
@@ -822,13 +826,15 @@ def init_upload_system():
     """初始化上传系统"""
     print("初始化上传系统...")
     
-    # 创建必要的目录
+    # 创建必要的目录（与app.py保持一致的路径）
+    base_dir = Path(__file__).resolve().parent
     directories = [
-        Path("knowledge"),
-        Path("knowledge/temp"),
-        Path("uploads/temp"),
-        Path("data"),
-        Path("data/backups")
+        base_dir / "uploads",
+        base_dir / "uploads" / "knowledge_bases",
+        base_dir / "uploads" / "temp",
+        base_dir / "uploads" / "temp" / "chunks",
+        base_dir / "data",
+        base_dir / "data" / "backups"
     ]
     
     for directory in directories:
