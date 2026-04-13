@@ -235,7 +235,7 @@ async def create_upload_session(
 async def upload_chunk(
     session_id: str,
     chunk_id: int,
-    chunk_data: UploadFile = File(...),
+    chunk_data: UploadFile = File(max_length=None),
     request_data: Optional[UploadChunkRequest] = None,
     upload_manager: ChunkedUploadManager = Depends(get_upload_manager),
     persistence: UploadPersistence = Depends(get_persistence_instance)
@@ -598,21 +598,18 @@ async def cancel_vectorization_task(
 # ====== 综合文件上传API ======
 
 async def _save_upload_file(kb_id: str, file: UploadFile) -> Tuple[bool, str, str]:
-    """保存单个上传文件，返回 (success, file_path_or_error, file_id)"""
+    """保存单个上传文件，返回 (success, file_path_or_error, file_id)
+    
+    优化版：使用大缓冲区 + 线程池写入，提升上传速度
+    """
+    import tempfile
+    from concurrent.futures import ThreadPoolExecutor
+    
     try:
-        # 保存文件到临时位置
-        import tempfile
-        with tempfile.NamedTemporaryFile(delete=False, suffix=file.filename) as tmp_file:
-            chunk_size = 16 * 1024 * 1024  # 16MB
-            file_size = 0
-            
-            while chunk := await file.read(chunk_size):
-                tmp_file.write(chunk)
-                file_size += len(chunk)
-            
-            temp_path = Path(tmp_file.name)
+        # 优化：使用 64MB 大缓冲区，减少 IO 次数
+        CHUNK_SIZE = 64 * 1024 * 1024  # 64MB 大块读取
         
-        # 保存文件到知识库（与app.py保持一致的路径）
+        # 获取目标路径
         kb_root = Path(__file__).resolve().parent / "uploads" / "knowledge_bases"
         kb_dir = kb_root / kb_id
         kb_dir.mkdir(parents=True, exist_ok=True)
@@ -627,8 +624,28 @@ async def _save_upload_file(kb_id: str, file: UploadFile) -> Tuple[bool, str, st
         final_filename = f"{timestamp}_{safe_name}"
         target_path = files_dir / final_filename
         
-        # 移动文件
-        shutil.move(temp_path, target_path)
+        # 直接写入目标文件（避免临时文件移动）
+        file_size = 0
+        
+        # 使用线程池执行阻塞的文件 IO 操作
+        loop = asyncio.get_event_loop()
+        
+        def _sync_write():
+            """在同步线程中执行的文件写入操作"""
+            nonlocal file_size
+            with open(target_path, 'wb', buffering=1024*1024*64) as f:  # 64MB 写入缓冲
+                while True:
+                    # 在同步函数中直接读取，不需要 await
+                    chunk = file.file.read(CHUNK_SIZE) if hasattr(file, 'file') else b''
+                    if not chunk:
+                        break
+                    f.write(chunk)
+                    file_size += len(chunk)
+                    # 定期刷新，确保数据写入磁盘
+                    if file_size % (256 * 1024 * 1024) == 0:  # 每 256MB 刷新
+                        f.flush()
+        
+        await loop.run_in_executor(ThreadPoolExecutor(max_workers=1), _sync_write)
         
         # 生成文件ID
         file_hash = hashlib.md5(target_path.read_bytes()).hexdigest()
@@ -700,7 +717,7 @@ async def _upload_file_complete_internal(
 
 async def upload_file_complete(
     kb_id: str = Form(...),
-    file: UploadFile = File(...),
+    file: UploadFile = File(max_length=None),
     priority: str = Form("normal"),
     upload_manager: ChunkedUploadManager = Depends(get_upload_manager),
     vectorization_queue: VectorizationQueue = Depends(get_vectorization_queue_instance),
@@ -743,7 +760,7 @@ async def upload_file_complete(
 @router.post("/upload/batch", response_model=BatchUploadResponse)
 async def upload_batch_files(
     kb_id: str = Form(...),
-    files: List[UploadFile] = File(...),
+    files: List[UploadFile] = File(max_length=None),
     priority: str = Form("normal"),
     upload_manager: ChunkedUploadManager = Depends(get_upload_manager),
     persistence: UploadPersistence = Depends(get_persistence_instance)

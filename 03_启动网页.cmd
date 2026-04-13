@@ -53,7 +53,7 @@ echo.
 echo 提示：关闭本窗口或按 Ctrl+C 可停止服务。
 echo.
 
-.venv\Scripts\uvicorn app:app --host 0.0.0.0 --port 8000
+.venv\Scripts\uvicorn app:app --host 0.0.0.0 --port 8000 --limit-max-bytes 107374182400 --timeout-keep-alive 300
 
 echo.
 pause

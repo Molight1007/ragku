@@ -46,8 +46,9 @@ from pydantic import BaseModel, Field
 from config import settings
 from rag_service import load_index, rag_answer, rag_answer_filtered
 
-MAX_UPLOAD_BYTES = 15 * 1024 * 1024
-MAX_FILE_SIZE = 15 * 1024 * 1024  # 15MB
+MAX_UPLOAD_BYTES = 50 * 1024 * 1024 * 1024   # 50GB 上传大小校验用
+MAX_FILE_SIZE = 50 * 1024 * 1024 * 1024      # 50GB
+MAX_UPLOAD_LENGTH = 50 * 1024 * 1024 * 1024   # 50GB FastAPI上传限制（None表示无限制）
 LEGACY_KB_ID = "legacy_fire"
 LEGACY_KB_NAME = "消防"
 UPLOAD_DIR = Path(__file__).resolve().parent / "uploads"
@@ -221,7 +222,7 @@ async def index() -> dict:
 
 
 @app.post("/api/ocr/image", response_model=OCRImageResponse)
-async def api_ocr_image(file: UploadFile = File(...)) -> OCRImageResponse:
+async def api_ocr_image(file: UploadFile = File(max_length=None)) -> OCRImageResponse:
     """上传图片，返回百炼 Qwen-OCR 识别的文字。"""
     from config import settings as app_settings
     from document_extract import is_image_filename, ocr_image_bytes
@@ -247,7 +248,7 @@ async def api_ocr_image(file: UploadFile = File(...)) -> OCRImageResponse:
 
 @app.post("/api/upload/file", response_model=UploadExtractResponse)
 @timed(name="文件上传接口")
-async def api_upload_file(file: UploadFile = File(...)) -> UploadExtractResponse:
+async def api_upload_file(file: UploadFile = File(max_length=None)) -> UploadExtractResponse:
     """上传文件：保存到本地 uploads/，并尽量提取文本（与知识库支持的类型一致）。"""
     from config import settings as app_settings
     from document_extract import (
@@ -415,7 +416,7 @@ async def api_kb_create(body: KnowledgeBaseCreateRequest) -> KnowledgeBaseInfo:
 @timed(name="知识库上传接口")
 async def api_kb_upload(
     kb_id: str = Form(...), 
-    file: UploadFile = File(..., max_length=MAX_FILE_SIZE)
+    file: UploadFile = File(max_length=None)
 ) -> KnowledgeBaseInfo:
     """上传文件到知识库（新版，使用分块上传系统）"""
     from upload_api import upload_file_complete
@@ -515,7 +516,7 @@ class BatchUploadResponse(BaseModel):
 @timed(name="批量上传接口")
 async def api_kb_upload_batch(
     kb_id: str = Form(...),
-    files: List[UploadFile] = File(..., max_length=MAX_FILE_SIZE)
+    files: List[UploadFile] = File(max_length=None)
 ) -> BatchUploadResponse:
     """批量上传多个文件到知识库，统一向量化"""
     from upload_api import upload_file_complete
@@ -625,7 +626,18 @@ async def api_kb_upload_batch(
 
 @app.get("/api/kb/{kb_id}/progress", response_model=KnowledgeBaseUploadProgress)
 async def api_kb_progress(kb_id: str) -> KnowledgeBaseUploadProgress:
+    """获取知识库上传/索引进度"""
     safe_id = _safe_kb_id(kb_id)
+    
+    # 安全检查：确保 kb_id 有效（允许空值，因为可能是 legacy 或无任务）
+    if not safe_id:
+        return KnowledgeBaseUploadProgress(
+            total_chunks=0, 
+            processed_chunks=0, 
+            done=True, 
+            message="无效的知识库ID"
+        )
+    
     with KB_UPLOAD_LOCK:
         p = KB_UPLOAD_PROGRESS.get(safe_id)
     if not p:
@@ -640,7 +652,16 @@ async def api_kb_progress(kb_id: str) -> KnowledgeBaseUploadProgress:
 
 @app.get("/api/kb/{kb_id}/files", response_model=KnowledgeBaseFileListResponse)
 async def api_kb_files(kb_id: str) -> KnowledgeBaseFileListResponse:
+    """获取知识库中的文件列表"""
     safe_id = _safe_kb_id(kb_id)
+    
+    # 安全检查：确保 kb_id 有效
+    if not safe_id:
+        raise HTTPException(
+            status_code=400, 
+            detail="无效的知识库ID"
+        )
+    
     if safe_id == LEGACY_KB_ID:
         if not _legacy_index_exists():
             return KnowledgeBaseFileListResponse(kb_id=safe_id, items=[])
@@ -652,6 +673,7 @@ async def api_kb_files(kb_id: str) -> KnowledgeBaseFileListResponse:
         items = [KnowledgeBaseFileItem(name=n, rel_path=n, size=0) for n in names]
         return KnowledgeBaseFileListResponse(kb_id=safe_id, items=items)
 
+    # 验证知识库目录存在
     base = _kb_dir(safe_id)
     if not base.exists() or not base.is_dir():
         raise HTTPException(status_code=404, detail="知识库不存在")
@@ -670,13 +692,35 @@ async def api_kb_files(kb_id: str) -> KnowledgeBaseFileListResponse:
 
 @app.delete("/api/kb/{kb_id}/file")
 async def api_kb_delete_file(kb_id: str, rel_path: str) -> dict:
+    """删除知识库中的文件
+    
+    安全检查：
+    1. 必须提供有效的 kb_id
+    2. 不能操作默认 legacy_fire 知识库
+    """
     safe_id = _safe_kb_id(kb_id)
+    
+    # 安全检查：确保 kb_id 有效
+    if not safe_id:
+        raise HTTPException(
+            status_code=400, 
+            detail="无效的知识库ID"
+        )
+    
+    # 保护默认知识库
     if safe_id == LEGACY_KB_ID:
-        raise HTTPException(status_code=400, detail="默认“消防”知识库不支持删除文件")
+        raise HTTPException(status_code=400, detail="默认「消防」知识库不支持删除文件")
 
+    # 验证知识库目录存在
     base = _kb_dir(safe_id)
     if not base.exists() or not base.is_dir():
         raise HTTPException(status_code=404, detail="知识库不存在")
+    
+    # 路径安全检查
+    try:
+        base.resolve().relative_to(KB_ROOT_DIR.resolve())
+    except ValueError:
+        raise HTTPException(status_code=400, detail="非法路径")
 
     files_dir = _kb_files_dir(safe_id)
     target = (files_dir / (rel_path or "")).resolve()
@@ -734,34 +778,54 @@ async def api_kb_delete_file(kb_id: str, rel_path: str) -> dict:
 
 @app.delete("/api/kb/{kb_id}")
 async def api_kb_delete(kb_id: str) -> dict:
+    """删除知识库（只能手动删除，保护用户数据）
+    
+    安全检查：
+    1. 必须提供有效的 kb_id
+    2. kb_id 必须是纯数字（由系统生成）
+    3. 不能删除 legacy_fire 默认知识库
+    """
     safe_id = _safe_kb_id(kb_id)
-
+    
+    # 安全检查：确保 kb_id 有效
+    if not safe_id:
+        raise HTTPException(
+            status_code=400, 
+            detail="无效的知识库ID"
+        )
+    
+    # 保护默认知识库
+    if safe_id == LEGACY_KB_ID:
+        raise HTTPException(
+            status_code=400, 
+            detail="默认「消防」知识库不可删除"
+        )
+    
+    # 取消任何进行中的重建任务
     with KB_UPLOAD_LOCK:
         KB_CANCEL_REBUILD.add(safe_id)
         KB_REBUILD_RUNNING.discard(safe_id)
         KB_UPLOAD_PROGRESS.pop(safe_id, None)
 
-    if safe_id == LEGACY_KB_ID:
-        removed = False
-        if settings.index_file.exists():
-            settings.index_file.unlink()
-            removed = True
-        if settings.meta_file.exists():
-            settings.meta_file.unlink()
-            removed = True
-        if not removed:
-            raise HTTPException(status_code=404, detail="知识库不存在")
-        return {"ok": True}
-
+    # 验证知识库目录存在
     base = _kb_dir(safe_id)
     if not base.exists() or not base.is_dir():
         raise HTTPException(status_code=404, detail="知识库不存在")
 
+    # 再次确认：base 必须是 KB_ROOT_DIR 的子目录，防止路径穿越
+    try:
+        base.resolve().relative_to(KB_ROOT_DIR.resolve())
+    except ValueError:
+        raise HTTPException(status_code=400, detail="非法路径")
+
+    # 删除索引文件
     for fp in (_kb_index_file(safe_id), _kb_meta_file(safe_id)):
         if fp.exists():
             fp.unlink()
+    
+    # 删除知识库目录
     shutil.rmtree(base)
-    return {"ok": True}
+    return {"ok": True, "message": f"知识库已删除"}
 
 
 @app.get("/chat-ui", response_class=HTMLResponse)
@@ -1867,7 +1931,7 @@ async def chat_ui() -> str:
                     uploadBtn.disabled = kb.id === 'legacy_fire';
                     uploadBtn.addEventListener('click', function () {
                         if (kb.id === 'legacy_fire') {
-                            setStatus('“消防”为默认知识库，不支持上传');
+                            setStatus('"消防"为默认知识库，不支持上传');
                             return;
                         }
                         kbUploadTargetId = kb.id;
@@ -2733,8 +2797,34 @@ async def chat_ui() -> str:
             }
         }
 
-        // 并行上传多个文件（使用批量上传API）
+        // 智能上传：自动选择最佳上传方式
+        // 大文件或多个文件时使用并行上传，小文件使用批量API
         async function uploadFilesBatch(kbId, files) {
+            // 大文件阈值：超过此大小启用并行上传
+            var LARGE_FILE_THRESHOLD = 100 * 1024 * 1024; // 100MB
+            
+            // 检查是否有大文件或多个文件
+            var hasLargeFile = false;
+            var totalSize = 0;
+            
+            for (var i = 0; i < files.length; i++) {
+                totalSize += files[i].size;
+                if (files[i].size > LARGE_FILE_THRESHOLD) {
+                    hasLargeFile = true;
+                }
+            }
+            
+            // 如果有大文件或超过3个小文件，使用并行上传
+            if (hasLargeFile || files.length > 3) {
+                return await uploadFilesInParallel(kbId, files);
+            }
+            
+            // 否则使用批量上传API
+            return await uploadFilesBatchAPI(kbId, files);
+        }
+        
+        // 批量上传API（单连接，适合小文件）
+        async function uploadFilesBatchAPI(kbId, files) {
             return new Promise(function (resolve, reject) {
                 var xhr = new XMLHttpRequest();
                 xhr.open('POST', apiUrl('/api/kb/upload/batch'));
@@ -2767,12 +2857,83 @@ async def chat_ui() -> str:
 
                 var fd = new FormData();
                 fd.append('kb_id', kbId);
-                // 添加所有文件
                 for (var i = 0; i < files.length; i++) {
                     fd.append('files', files[i], files[i].name);
                 }
                 xhr.send(fd);
             });
+        }
+        
+        // 真正的并行上传（多连接，显著提升大文件速度）
+        async function uploadFilesInParallel(kbId, files) {
+            var MAX_CONCURRENT = 3; // 最多3个并发连接
+            var results = [];
+            var totalBytes = 0;
+            var uploadedBytes = 0;
+            
+            // 计算总大小
+            for (var i = 0; i < files.length; i++) {
+                totalBytes += files[i].size;
+            }
+            
+            function uploadSingleFile(file) {
+                return new Promise(function(resolve, reject) {
+                    var xhr = new XMLHttpRequest();
+                    xhr.open('POST', apiUrl('/api/kb/upload'));
+                    xhr.responseType = 'json';
+                    
+                    var fileUploaded = 0;
+                    
+                    xhr.upload.onprogress = function(evt) {
+                        if (evt.lengthComputable && evt.total > 0) {
+                            var delta = evt.loaded - fileUploaded;
+                            fileUploaded = evt.loaded;
+                            uploadedBytes += delta;
+                            var p = Math.round((uploadedBytes / totalBytes) * 100);
+                            setStatus('并行上传中：' + p + '%（' + files.length + '个文件）');
+                        }
+                    };
+                    
+                    xhr.onload = function() {
+                        var data = xhr.response;
+                        if (!data && xhr.responseText) {
+                            try { data = JSON.parse(xhr.responseText); } catch (e) {}
+                        }
+                        if (xhr.status >= 200 && xhr.status < 300) {
+                            resolve(data || {});
+                        } else {
+                            reject(new Error((data && data.detail) ? data.detail : ('HTTP ' + xhr.status)));
+                        }
+                    };
+                    
+                    xhr.onerror = function() {
+                        reject(new Error('网络错误，上传失败: ' + file.name));
+                    };
+                    
+                    var fd = new FormData();
+                    fd.append('kb_id', kbId);
+                    fd.append('file', file, file.name);
+                    xhr.send(fd);
+                });
+            }
+            
+            // 分批并行上传
+            for (var i = 0; i < files.length; i += MAX_CONCURRENT) {
+                var batch = files.slice(i, i + MAX_CONCURRENT);
+                var batchPromises = batch.map(function(file) {
+                    return uploadSingleFile(file);
+                });
+                
+                var batchResults = await Promise.all(batchPromises);
+                results = results.concat(batchResults);
+            }
+            
+            return {
+                kb_id: kbId,
+                success: true,
+                message: '成功上传 ' + results.length + ' 个文件（并行模式）',
+                uploaded_files: results.length
+            };
         }
 
         if (kbFileInput) {

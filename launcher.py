@@ -61,6 +61,10 @@ def _server_command() -> list[str]:
         "0.0.0.0",
         "--port",
         str(SERVER_PORT),
+        "--limit-max-bytes",
+        str(100 * 1024 * 1024 * 1024),  # 100GB 最大请求体
+        "--timeout-keep-alive",
+        "300",  # 5分钟长连接超时
     ]
 
 
@@ -522,7 +526,7 @@ def main() -> None:
             print(f"[启动失败] 导入 app 模块异常: {e}")
             raise
 
-        uvicorn.run(fastapi_app, host="0.0.0.0", port=int(args.port), log_level="info")
+        uvicorn.run(fastapi_app, host="0.0.0.0", port=int(args.port), log_level="info", limit_max_bytes=100 * 1024 * 1024 * 1024, timeout_keep_alive=300)
         return
 
     if "--console" in sys.argv:

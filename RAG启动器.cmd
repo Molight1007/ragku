@@ -224,7 +224,7 @@ echo  按 Ctrl+C 可停止服务
 echo.
 echo  启动中...
 
-.venv\Scripts\uvicorn app:app --host 0.0.0.0 --port 8000
+.venv\Scripts\uvicorn app:app --host 0.0.0.0 --port 8000 --limit-max-bytes 107374182400 --timeout-keep-alive 300
 
 echo.
 echo  服务已停止。
@@ -321,7 +321,7 @@ echo.
 echo  按 Ctrl+C 可停止服务
 echo.
 
-.venv\Scripts\uvicorn app:app --host 0.0.0.0 --port 8000
+.venv\Scripts\uvicorn app:app --host 0.0.0.0 --port 8000 --limit-max-bytes 107374182400 --timeout-keep-alive 300
 
 pause
 goto menu

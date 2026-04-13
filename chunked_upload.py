@@ -25,7 +25,7 @@ from fastapi import HTTPException, UploadFile
 
 # 配置常量
 CHUNK_SIZE = 5 * 1024 * 1024  # 5MB分块
-MAX_CHUNKS_PER_FILE = 1000    # 最大分块数
+MAX_CHUNKS_PER_FILE = 10000   # 最大分块数（5MB*10000≈50GB）
 RESUME_EXPIRY_HOURS = 24      # 断点续传有效期24小时
 # 临时上传目录（使用绝对路径，与app.py保持一致）
 UPLOAD_TEMP_DIR = Path(__file__).resolve().parent / "uploads" / "temp" / "chunks"
