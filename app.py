@@ -2610,6 +2610,8 @@ async def chat_ui() -> str:
                 var total = files.length;
                 var ok = 0;
                 var lastData = null;
+                var savedKbDetailId = kbDetailOpenForId;
+                kbDetailOpenForId = null;
                 try {
                     for (var i = 0; i < files.length; i++) {
                         var f = files[i];
@@ -2632,6 +2634,7 @@ async def chat_ui() -> str:
                     setStatus('知识库导入中断：已成功 ' + ok + ' / ' + total + '，原因：' + (err.message || err));
                 } finally {
                     kbUploadTargetId = null;
+                    kbDetailOpenForId = savedKbDetailId;
                 }
             });
         }
