@@ -39,7 +39,7 @@ class Settings:
     meta_file: Path = Path("index_meta.npy")
 
     # 文本分片参数
-    chunk_size: int = 500  # 每个分片的最大字符数
+    chunk_size: int = 800  # 每个分片的最大字符数（增大可减少分片数量）
     chunk_overlap: int = 100  # 分片之间的重叠字符数
 
     # 检索参数

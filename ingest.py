@@ -1,5 +1,8 @@
 import argparse
 import os
+import time
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from http import HTTPStatus
 from pathlib import Path
 from typing import List, Tuple
@@ -11,6 +14,15 @@ from dashscope import TextEmbedding
 from docx import Document
 
 from config import settings
+
+# API 超时时间（秒）
+API_TIMEOUT = 60
+# 重试次数
+MAX_RETRIES = 3
+# 重试间隔（秒）
+RETRY_DELAY = 5
+# 并发数
+MAX_CONCURRENCY = 8
 
 
 def read_txt(path: Path) -> str:
@@ -91,8 +103,44 @@ def collect_documents(data_dir: Path) -> List[Tuple[str, str]]:
     return docs
 
 
+def _process_single_doc(idx: int, source: str, text: str) -> Tuple[int, List[float], dict] | None:
+    """处理单个分片，返回 (索引, 向量, 元数据) 或 None"""
+    for retry in range(MAX_RETRIES):
+        try:
+            resp = TextEmbedding.call(
+                model=settings.embedding_model,
+                input=text,
+                timeout=API_TIMEOUT,
+            )
+            status = getattr(resp, "status_code", None)
+            if status != HTTPStatus.OK:
+                code = getattr(resp, "code", "")
+                msg = getattr(resp, "message", "") or str(resp)
+                if retry < MAX_RETRIES - 1:
+                    time.sleep(RETRY_DELAY)
+                    continue
+                print(f"第 {idx} 条失败（{source}）: {code} {msg}")
+                return None
+
+            output = resp.output if hasattr(resp, "output") else resp["output"]
+            emb_list = output["embeddings"] if isinstance(output, dict) else output.embeddings
+            vector = emb_list[0]["embedding"] if isinstance(emb_list[0], dict) else emb_list[0].embedding
+            return (idx, list(vector), {"source": source, "text": text})
+        except TimeoutError:
+            if retry < MAX_RETRIES - 1:
+                time.sleep(RETRY_DELAY)
+                continue
+            print(f"第 {idx} 条超时（{source}）")
+        except Exception as e:  # noqa: BLE001
+            if retry < MAX_RETRIES - 1:
+                time.sleep(RETRY_DELAY)
+                continue
+            print(f"第 {idx} 条异常（{source}）: {e}")
+    return None
+
+
 def build_embeddings(docs: List[Tuple[str, str]]) -> Tuple[np.ndarray, List[dict]]:
-    """调用 DashScope 文本向量接口，为每个文档分片生成向量。"""
+    """调用 DashScope 文本向量接口，为每个文档分片生成向量（并发模式）。"""
     if not settings.dashscope_api_key:
         raise RuntimeError("未检测到 DASHSCOPE_API_KEY，请先在环境变量或 .env 中配置。")
 
@@ -103,45 +151,44 @@ def build_embeddings(docs: List[Tuple[str, str]]) -> Tuple[np.ndarray, List[dict
 
     dashscope.api_key = settings.dashscope_api_key
 
-    embeddings: List[List[float]] = []
-    metadatas: List[dict] = []
-    last_api_hint: str = ""
+    total = len(docs)
+    results: List[Tuple[int, List[float], dict]] = []
+    results_lock = threading.Lock()
 
-    for idx, (source, text) in enumerate(docs, start=1):
-        try:
-            resp = TextEmbedding.call(
-                model=settings.embedding_model,
-                input=text,
-            )
-            status = getattr(resp, "status_code", None)
-            if status != HTTPStatus.OK:
-                code = getattr(resp, "code", "")
-                msg = getattr(resp, "message", "") or str(resp)
-                last_api_hint = f"status={status}, code={code}, message={msg}"
-                print(f"向量化失败，第 {idx} 条，来源 {source}，{last_api_hint}")
-                continue
+    print(f"开始并发向量化（共 {total} 条，并发数 {MAX_CONCURRENCY}）...")
 
-            output = resp.output if hasattr(resp, "output") else resp["output"]
-            emb_list = output["embeddings"] if isinstance(output, dict) else output.embeddings
-            vector = emb_list[0]["embedding"] if isinstance(emb_list[0], dict) else emb_list[0].embedding
-            embeddings.append(list(vector))
-            metadatas.append({"source": source, "text": text})
-        except Exception as e:  # noqa: BLE001
-            print(f"向量化失败，第 {idx} 条，来源 {source}，错误: {e}")
-            last_api_hint = str(e)
-            continue
+    with ThreadPoolExecutor(max_workers=MAX_CONCURRENCY) as executor:
+        futures = {
+            executor.submit(_process_single_doc, i + 1, src, txt): i + 1
+            for i, (src, txt) in enumerate(docs)
+        }
 
-        if idx % 20 == 0:
-            print(f"已完成向量化 {idx} 条文档分片")
+        for future in as_completed(futures):
+            idx = futures[future]
+            try:
+                result = future.result()
+                if result is not None:
+                    with results_lock:
+                        results.append(result)
+                        done = len(results)
+                        if done % 20 == 0 or done == total:
+                            print(f"已完成向量化 {done}/{total} 条文档分片")
+            except Exception:  # noqa: BLE001
+                pass
+
+    # 按原始顺序排列
+    results.sort(key=lambda x: x[0])
+    embeddings = [r[1] for r in results]
+    metadatas = [r[2] for r in results]
 
     if not embeddings:
-        detail = f" 最后一条 API 反馈: {last_api_hint}" if last_api_hint else ""
         raise RuntimeError(
             "未成功生成任何向量。请检查：1) DASHSCOPE_API_KEY 是否有效、有余额；"
             f"2) config 中 embedding_model（当前 {settings.embedding_model!r}）是否与控制台可用模型一致；"
-            "3) 本机网络能否访问 DashScope。" + detail
+            "3) 本机网络能否访问 DashScope。"
         )
 
+    print(f"向量化完成，共成功 {len(embeddings)}/{total} 条")
     return np.array(embeddings, dtype="float32"), metadatas
 
 

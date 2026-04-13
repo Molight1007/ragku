@@ -4,10 +4,11 @@ import asyncio
 import secrets
 import shutil
 import threading
+import time
 import uuid
 from http import HTTPStatus
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 import dashscope
 
@@ -145,6 +146,7 @@ class KnowledgeBaseUploadProgress(BaseModel):
     processed_chunks: int
     done: bool
     message: str = ""
+    estimated_remaining_seconds: int = -1
 
 
 class KnowledgeBaseFileItem(BaseModel):
@@ -269,12 +271,13 @@ def _build_embeddings_for_kb_with_progress(docs: List[tuple[str, str]], kb_id: s
     if not docs:
         raise RuntimeError("没有可向量化的文本分片。")
 
+    import concurrent.futures
     from dashscope import TextEmbedding
 
     dashscope.api_key = settings.dashscope_api_key
 
-    embeddings: List[List[float]] = []
-    metadatas: List[dict] = []
+    # 并发数设置（DashScope QPS 限制约为 10，并发 8 留有余量）
+    MAX_CONCURRENCY = 8
     total = len(docs)
 
     with KB_UPLOAD_LOCK:
@@ -282,15 +285,19 @@ def _build_embeddings_for_kb_with_progress(docs: List[tuple[str, str]], kb_id: s
             "total": total,
             "processed": 0,
             "done": False,
-            "message": "开始分片向量化",
+            "message": "开始分片向量化（并发模式）",
+            "start_time": time.time(),
         }
 
-    for idx, (source, text) in enumerate(docs, start=1):
+    results: List[Tuple[int, List[float], dict]] = []
+    results_lock = threading.Lock()
+
+    def _process_single(idx: int, source: str, text: str) -> Tuple[int, List[float], dict] | None:
+        """处理单个分片，返回 (索引, 向量, 元数据) 或 None（失败时）"""
         with KB_UPLOAD_LOCK:
             if kb_id in KB_CANCEL_REBUILD:
-                KB_UPLOAD_PROGRESS[kb_id]["done"] = True
-                KB_UPLOAD_PROGRESS[kb_id]["message"] = "重建已取消"
                 raise RuntimeError("重建已取消")
+
         try:
             resp = TextEmbedding.call(model=settings.embedding_model, input=text)
             status = getattr(resp, "status_code", None)
@@ -298,24 +305,46 @@ def _build_embeddings_for_kb_with_progress(docs: List[tuple[str, str]], kb_id: s
                 code = getattr(resp, "code", "")
                 msg = getattr(resp, "message", "") or str(resp)
                 with KB_UPLOAD_LOCK:
-                    KB_UPLOAD_PROGRESS[kb_id]["processed"] = idx
-                    KB_UPLOAD_PROGRESS[kb_id]["message"] = f"第 {idx}/{total} 分片失败: {code} {msg}".strip()
-                continue
+                    p = KB_UPLOAD_PROGRESS[kb_id]
+                    p["processed"] = max(p["processed"], idx)
+                    p["message"] = f"第 {idx}/{total} 分片失败: {code} {msg}".strip()
+                return None
 
             output = resp.output if hasattr(resp, "output") else resp["output"]
             emb_list = output["embeddings"] if isinstance(output, dict) else output.embeddings
             vector = emb_list[0]["embedding"] if isinstance(emb_list[0], dict) else emb_list[0].embedding
-            embeddings.append(list(vector))
-            metadatas.append({"source": source, "text": text})
-        except Exception as e:  # noqa: BLE001
+            return (idx, list(vector), {"source": source, "text": text})
+        except Exception as e:
             with KB_UPLOAD_LOCK:
-                KB_UPLOAD_PROGRESS[kb_id]["processed"] = idx
-                KB_UPLOAD_PROGRESS[kb_id]["message"] = f"第 {idx}/{total} 分片异常: {e}"
-            continue
+                p = KB_UPLOAD_PROGRESS[kb_id]
+                p["processed"] = max(p["processed"], idx)
+                p["message"] = f"第 {idx}/{total} 分片异常: {e}"
+            return None
 
-        with KB_UPLOAD_LOCK:
-            KB_UPLOAD_PROGRESS[kb_id]["processed"] = idx
-            KB_UPLOAD_PROGRESS[kb_id]["message"] = f"分片向量化进度 {idx}/{total}"
+    # 使用线程池并发处理
+    with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_CONCURRENCY) as executor:
+        futures = {
+            executor.submit(_process_single, i + 1, src, txt): (i + 1, src)
+            for i, (src, txt) in enumerate(docs)
+        }
+
+        for future in concurrent.futures.as_completed(futures):
+            try:
+                result = future.result()
+                if result is not None:
+                    idx, vector, meta = result
+                    with results_lock:
+                        results.append((idx, vector, meta))
+                    with KB_UPLOAD_LOCK:
+                        KB_UPLOAD_PROGRESS[kb_id]["processed"] = len(results)
+                        KB_UPLOAD_PROGRESS[kb_id]["message"] = f"分片向量化进度 {len(results)}/{total}"
+            except Exception:
+                pass
+
+    # 按原始顺序排列结果
+    results.sort(key=lambda x: x[0])
+    embeddings = [r[1] for r in results]
+    metadatas = [r[2] for r in results]
 
     if not embeddings:
         with KB_UPLOAD_LOCK:
@@ -467,11 +496,26 @@ async def api_kb_progress(kb_id: str) -> KnowledgeBaseUploadProgress:
         p = KB_UPLOAD_PROGRESS.get(safe_id)
     if not p:
         return KnowledgeBaseUploadProgress(total_chunks=0, processed_chunks=0, done=True, message="暂无任务")
+
+    # 计算预估剩余时间
+    estimated_remaining = -1
+    total = int(p.get("total", 0))
+    processed = int(p.get("processed", 0))
+    start_time = p.get("start_time")
+    done = bool(p.get("done", False))
+
+    if not done and start_time and processed > 0 and total > processed:
+        elapsed = time.time() - start_time
+        avg_time_per_chunk = elapsed / processed
+        remaining_chunks = total - processed
+        estimated_remaining = int(avg_time_per_chunk * remaining_chunks)
+
     return KnowledgeBaseUploadProgress(
-        total_chunks=int(p.get("total", 0)),
-        processed_chunks=int(p.get("processed", 0)),
-        done=bool(p.get("done", False)),
+        total_chunks=total,
+        processed_chunks=processed,
+        done=done,
         message=str(p.get("message", "")),
+        estimated_remaining_seconds=estimated_remaining,
     )
 
 
@@ -1491,7 +1535,7 @@ async def chat_ui() -> str:
         function setKbFileRowProgress(kbId, percent, message) {
             if (!kbLinkedPanel || !kbLinkedPanel.classList.contains('open')) return;
             if (!kbDetailOpenForId || kbDetailOpenForId !== kbId) return;
-            var rows = kbLinkedList ? kbLinkedList.querySelectorAll('.kb-file-row') : [];
+            var rows = kbLinkedList ? kbLinkedList.querySelectorAll('.kb-file-row[data-kb-id="' + kbId + '"]') : [];
             var p = Math.max(0, Math.min(100, Number(percent || 0)));
             for (var i = 0; i < rows.length; i++) {
                 rows[i].style.setProperty('--fill', p + '%');
@@ -1808,6 +1852,7 @@ async def chat_ui() -> str:
                     (function (f) {
                         var row = document.createElement('div');
                         row.className = 'kb-file-row';
+                        row.dataset.kbId = kb.id;
 
                         var top = document.createElement('div');
                         top.className = 'kb-file-row-top';
@@ -2474,6 +2519,19 @@ async def chat_ui() -> str:
             }
         }
 
+        function _fmtRemainingTime(seconds) {
+            if (!seconds || seconds < 0) return '';
+            if (seconds < 60) return '约 ' + seconds + '秒';
+            if (seconds < 3600) {
+                var m = Math.floor(seconds / 60);
+                var s = seconds % 60;
+                return '约 ' + m + '分' + (s > 0 ? s + '秒' : '');
+            }
+            var h = Math.floor(seconds / 3600);
+            var m = Math.floor((seconds % 3600) / 60);
+            return '约 ' + h + '小时' + (m > 0 ? m + '分' : '');
+        }
+
         async function waitKbRebuildProgress(kbId, persistTracking) {
             if (persistTracking) saveUploadTracking(kbId);
             var maxLoop = 360;
@@ -2496,10 +2554,15 @@ async def chat_ui() -> str:
                 var total = Number(data.total_chunks || 0);
                 var done = Number(data.processed_chunks || 0);
                 var msg = data.message || '';
+                var remaining = data.estimated_remaining_seconds;
+                var remainingText = _fmtRemainingTime(remaining);
                 if (total > 0) {
                     var p = Math.max(0, Math.min(100, Math.round(done * 100 / total)));
-                    setStatus('分片处理中：' + done + '/' + total + '（' + p + '%）' + (msg ? ' - ' + msg : ''));
-                    setKbFileRowProgress(kbId, p, msg);
+                    var statusText = '分片处理中：' + done + '/' + total + '（' + p + '%）';
+                    if (remainingText) statusText += '，剩余 ' + remainingText;
+                    if (msg) statusText += ' - ' + msg;
+                    setStatus(statusText);
+                    setKbFileRowProgress(kbId, p, statusText);
                 } else {
                     setStatus(msg || '分片处理中…');
                     setKbFileRowProgress(kbId, 0, msg);
