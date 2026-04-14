@@ -1,51 +1,35 @@
 # Python
 __pycache__/
-*.py[cod]
-*$py.class
-*.so
+*.pyc
+*.pyo
+*.pyd
 .Python
-build/
-develop-eggs/
-dist/
-downloads/
-eggs/
-.eggs/
-lib/
-lib64/
-parts/
-sdist/
-var/
-wheels/
 *.egg-info/
-.installed.cfg
+dist/
+build/
 *.egg
-
-# Virtual environments
-.venv/
-venv/
-ENV/
 
 # IDE
 .vscode/
 .idea/
 *.swp
 *.swo
-*~
 
-# OS
+# 临时文件
+*.tmp
+*.temp
 .DS_Store
-Thumbs.db
 
-# App specific
-*.log
-.env
-data/upload_persistence.db
-uploads/knowledge_bases/*/
-!uploads/knowledge_bases/.gitkeep
-*.npy
-.pytest_cache/
-.coverage
-htmlcov/
+# 打包产物
+*.zip
+*.tar.gz
+
+# 索引文件（运行时生成）
+index_store.npy
+index_meta.npy
 
 # CodeBuddy
 .codebuddy/
+
+# 本地上传
+uploads/

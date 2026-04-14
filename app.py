@@ -4,51 +4,27 @@ import asyncio
 import secrets
 import shutil
 import threading
+import time
 import uuid
 from http import HTTPStatus
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 import dashscope
 
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile, Request
-# 性能优化模块 - 添加性能监控和缓存
-try:
-    from simple_performance import timed, cached, integrate_with_fastapi, cache
-    print("性能优化模块导入成功")
-except ImportError:
-    print("警告: simple_performance 模块未找到，跳过性能优化集成")
-    # 创建空的装饰器防止导入错误
-    def timed(func=None, *args, **kwargs):
-        def decorator(f):
-            return f
-        return decorator if func is None else decorator(func)
-    
-    def cached(func=None, *args, **kwargs):
-        def decorator(f):
-            return f
-        return decorator if func is None else decorator(func)
-    
-    cache = None
-
-# FastAPI增强组件
-from fastapi.responses import HTMLResponse, JSONResponse
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.middleware.gzip import GZipMiddleware
-from starlette.exceptions import HTTPException as StarletteHTTPException
-
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 
 # 新上传系统导入
 from upload_api import router as upload_router, init_upload_system
+from fastapi.responses import HTMLResponse
+from fastapi.middleware.cors import CORSMiddleware
 import numpy as np
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 
 from config import settings
 from rag_service import load_index, rag_answer, rag_answer_filtered
 
-MAX_UPLOAD_BYTES = 50 * 1024 * 1024 * 1024   # 50GB 上传大小校验用
-MAX_FILE_SIZE = 50 * 1024 * 1024 * 1024      # 50GB
-MAX_UPLOAD_LENGTH = 50 * 1024 * 1024 * 1024   # 50GB FastAPI上传限制（None表示无限制）
+MAX_UPLOAD_BYTES = 15 * 1024 * 1024
 LEGACY_KB_ID = "legacy_fire"
 LEGACY_KB_NAME = "消防"
 UPLOAD_DIR = Path(__file__).resolve().parent / "uploads"
@@ -138,6 +114,22 @@ class OCRImageResponse(BaseModel):
     filename: str
 
 
+class VisionChatRequest(BaseModel):
+    """看图分析聊天请求模型。"""
+
+    question: str = ""
+    kb_id: Optional[str] = None
+    selected_files: Optional[List[str]] = None
+
+
+class VisionChatResponse(BaseModel):
+    """看图分析聊天返回数据结构。"""
+
+    answer: str
+    contexts: List[ContextSnippet]
+    image_analysis: str  # 图片分析结果
+
+
 class UploadExtractResponse(BaseModel):
     """文件上传并解析文本后的返回。"""
 
@@ -173,6 +165,7 @@ class KnowledgeBaseUploadProgress(BaseModel):
     processed_chunks: int
     done: bool
     message: str = ""
+    estimated_remaining_seconds: int = -1
 
 
 class KnowledgeBaseFileItem(BaseModel):
@@ -201,16 +194,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# 添加GZIP压缩中间件
-app.add_middleware(GZipMiddleware, minimum_size=1000)
-
-# 集成性能优化到FastAPI应用
-try:
-    app = integrate_with_fastapi(app)
-    print("性能优化集成到FastAPI应用完成")
-except Exception as e:
-    print(f"性能优化集成失败: {e}")
-
 
 @app.get("/")
 async def index() -> dict:
@@ -222,7 +205,7 @@ async def index() -> dict:
 
 
 @app.post("/api/ocr/image", response_model=OCRImageResponse)
-async def api_ocr_image(file: UploadFile = File(max_length=None)) -> OCRImageResponse:
+async def api_ocr_image(file: UploadFile = File(...)) -> OCRImageResponse:
     """上传图片，返回百炼 Qwen-OCR 识别的文字。"""
     from config import settings as app_settings
     from document_extract import is_image_filename, ocr_image_bytes
@@ -247,8 +230,7 @@ async def api_ocr_image(file: UploadFile = File(max_length=None)) -> OCRImageRes
 
 
 @app.post("/api/upload/file", response_model=UploadExtractResponse)
-@timed(name="文件上传接口")
-async def api_upload_file(file: UploadFile = File(max_length=None)) -> UploadExtractResponse:
+async def api_upload_file(file: UploadFile = File(...)) -> UploadExtractResponse:
     """上传文件：保存到本地 uploads/，并尽量提取文本（与知识库支持的类型一致）。"""
     from config import settings as app_settings
     from document_extract import (
@@ -308,12 +290,13 @@ def _build_embeddings_for_kb_with_progress(docs: List[tuple[str, str]], kb_id: s
     if not docs:
         raise RuntimeError("没有可向量化的文本分片。")
 
+    import concurrent.futures
     from dashscope import TextEmbedding
 
     dashscope.api_key = settings.dashscope_api_key
 
-    embeddings: List[List[float]] = []
-    metadatas: List[dict] = []
+    # 并发数设置（DashScope QPS 限制约为 10，并发 8 留有余量）
+    MAX_CONCURRENCY = 8
     total = len(docs)
 
     with KB_UPLOAD_LOCK:
@@ -321,15 +304,19 @@ def _build_embeddings_for_kb_with_progress(docs: List[tuple[str, str]], kb_id: s
             "total": total,
             "processed": 0,
             "done": False,
-            "message": "开始分片向量化",
+            "message": "开始分片向量化（并发模式）",
+            "start_time": time.time(),
         }
 
-    for idx, (source, text) in enumerate(docs, start=1):
+    results: List[Tuple[int, List[float], dict]] = []
+    results_lock = threading.Lock()
+
+    def _process_single(idx: int, source: str, text: str) -> Tuple[int, List[float], dict] | None:
+        """处理单个分片，返回 (索引, 向量, 元数据) 或 None（失败时）"""
         with KB_UPLOAD_LOCK:
             if kb_id in KB_CANCEL_REBUILD:
-                KB_UPLOAD_PROGRESS[kb_id]["done"] = True
-                KB_UPLOAD_PROGRESS[kb_id]["message"] = "重建已取消"
                 raise RuntimeError("重建已取消")
+
         try:
             resp = TextEmbedding.call(model=settings.embedding_model, input=text)
             status = getattr(resp, "status_code", None)
@@ -337,24 +324,46 @@ def _build_embeddings_for_kb_with_progress(docs: List[tuple[str, str]], kb_id: s
                 code = getattr(resp, "code", "")
                 msg = getattr(resp, "message", "") or str(resp)
                 with KB_UPLOAD_LOCK:
-                    KB_UPLOAD_PROGRESS[kb_id]["processed"] = idx
-                    KB_UPLOAD_PROGRESS[kb_id]["message"] = f"第 {idx}/{total} 分片失败: {code} {msg}".strip()
-                continue
+                    p = KB_UPLOAD_PROGRESS[kb_id]
+                    p["processed"] = max(p["processed"], idx)
+                    p["message"] = f"第 {idx}/{total} 分片失败: {code} {msg}".strip()
+                return None
 
             output = resp.output if hasattr(resp, "output") else resp["output"]
             emb_list = output["embeddings"] if isinstance(output, dict) else output.embeddings
             vector = emb_list[0]["embedding"] if isinstance(emb_list[0], dict) else emb_list[0].embedding
-            embeddings.append(list(vector))
-            metadatas.append({"source": source, "text": text})
-        except Exception as e:  # noqa: BLE001
+            return (idx, list(vector), {"source": source, "text": text})
+        except Exception as e:
             with KB_UPLOAD_LOCK:
-                KB_UPLOAD_PROGRESS[kb_id]["processed"] = idx
-                KB_UPLOAD_PROGRESS[kb_id]["message"] = f"第 {idx}/{total} 分片异常: {e}"
-            continue
+                p = KB_UPLOAD_PROGRESS[kb_id]
+                p["processed"] = max(p["processed"], idx)
+                p["message"] = f"第 {idx}/{total} 分片异常: {e}"
+            return None
 
-        with KB_UPLOAD_LOCK:
-            KB_UPLOAD_PROGRESS[kb_id]["processed"] = idx
-            KB_UPLOAD_PROGRESS[kb_id]["message"] = f"分片向量化进度 {idx}/{total}"
+    # 使用线程池并发处理
+    with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_CONCURRENCY) as executor:
+        futures = {
+            executor.submit(_process_single, i + 1, src, txt): (i + 1, src)
+            for i, (src, txt) in enumerate(docs)
+        }
+
+        for future in concurrent.futures.as_completed(futures):
+            try:
+                result = future.result()
+                if result is not None:
+                    idx, vector, meta = result
+                    with results_lock:
+                        results.append((idx, vector, meta))
+                    with KB_UPLOAD_LOCK:
+                        KB_UPLOAD_PROGRESS[kb_id]["processed"] = len(results)
+                        KB_UPLOAD_PROGRESS[kb_id]["message"] = f"分片向量化进度 {len(results)}/{total}"
+            except Exception:
+                pass
+
+    # 按原始顺序排列结果
+    results.sort(key=lambda x: x[0])
+    embeddings = [r[1] for r in results]
+    metadatas = [r[2] for r in results]
 
     if not embeddings:
         with KB_UPLOAD_LOCK:
@@ -413,10 +422,9 @@ async def api_kb_create(body: KnowledgeBaseCreateRequest) -> KnowledgeBaseInfo:
 
 
 @app.post("/api/kb/upload", response_model=KnowledgeBaseInfo)
-@timed(name="知识库上传接口")
 async def api_kb_upload(
     kb_id: str = Form(...), 
-    file: UploadFile = File(max_length=None)
+    file: UploadFile = File(..., max_length=MAX_FILE_SIZE)
 ) -> KnowledgeBaseInfo:
     """上传文件到知识库（新版，使用分块上传系统）"""
     from upload_api import upload_file_complete
@@ -447,48 +455,6 @@ async def api_kb_upload(
             except:
                 pass
         
-        # 启动向量化任务
-        safe_id = _safe_kb_id(kb_id)
-        KB_REBUILD_RUNNING.add(safe_id)
-        KB_UPLOAD_PROGRESS[safe_id] = {
-            "total": 1,
-            "processed": 0,
-            "done": False,
-            "message": "文件已上传，等待重建索引",
-        }
-
-        async def _rebuild() -> None:
-            try:
-                docs = await asyncio.to_thread(_collect_documents_for_kb, files_dir)
-                if not docs:
-                    with KB_UPLOAD_LOCK:
-                        KB_UPLOAD_PROGRESS[safe_id] = {
-                            "total": 0,
-                            "processed": 0,
-                            "done": True,
-                            "message": "知识库未提取到可向量化文本",
-                        }
-                    return
-                embeddings, metadatas = await asyncio.to_thread(_build_embeddings_for_kb_with_progress, docs, safe_id)
-                await asyncio.to_thread(np.save, _kb_index_file(safe_id), embeddings)
-                await asyncio.to_thread(np.save, _kb_meta_file(safe_id), np.array(metadatas, dtype=object))
-                with KB_UPLOAD_LOCK:
-                    p = KB_UPLOAD_PROGRESS.get(safe_id, {})
-                    p["done"] = True
-                    p["message"] = "索引重建完成"
-                    KB_UPLOAD_PROGRESS[safe_id] = p
-            except Exception as e:  # noqa: BLE001
-                with KB_UPLOAD_LOCK:
-                    p = KB_UPLOAD_PROGRESS.get(safe_id, {"total": 0, "processed": 0})
-                    p["done"] = True
-                    p["message"] = f"索引重建失败: {e}"
-                    KB_UPLOAD_PROGRESS[safe_id] = p
-            finally:
-                with KB_UPLOAD_LOCK:
-                    KB_REBUILD_RUNNING.discard(safe_id)
-
-        asyncio.create_task(_rebuild())
-        
         return KnowledgeBaseInfo(
             id=kb_id,
             name=kb_name,
@@ -501,167 +467,84 @@ async def api_kb_upload(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"文件上传失败: {str(e)}")
 
-
-class BatchUploadResponse(BaseModel):
-    """批量上传响应"""
-    kb_id: str
-    kb_name: str
-    total_files: int
-    success_count: int
-    failed_files: List[str]
-    message: str
-
-
-@app.post("/api/kb/upload/batch", response_model=BatchUploadResponse)
-@timed(name="批量上传接口")
-async def api_kb_upload_batch(
-    kb_id: str = Form(...),
-    files: List[UploadFile] = File(max_length=None)
-) -> BatchUploadResponse:
-    """批量上传多个文件到知识库，统一向量化"""
-    from upload_api import upload_file_complete
-    
-    safe_id = _safe_kb_id(kb_id)
-    success_count = 0
-    failed_files: List[str] = []
-    
-    try:
-        # 并行上传所有文件
-        async def upload_single(file: UploadFile) -> Tuple[bool, str]:
-            try:
-                result = await upload_file_complete(
-                    kb_id=kb_id,
-                    file=file,
-                    priority="normal"
-                )
-                if result.success:
-                    return True, file.filename
-                else:
-                    return False, f"{file.filename}: {result.message}"
-            except Exception as e:
-                return False, f"{file.filename}: {str(e)}"
-        
-        # 使用asyncio.gather并行上传
-        results = await asyncio.gather(*[upload_single(f) for f in files], return_exceptions=True)
-        
-        for r in results:
-            if isinstance(r, Exception):
-                failed_files.append(f"异常: {str(r)}")
-            elif isinstance(r, tuple):
-                success, msg = r
-                if success:
-                    success_count += 1
-                else:
-                    failed_files.append(msg)
-        
-        # 获取知识库信息
-        files_dir = _kb_files_dir(kb_id)
-        kb_name = "未知"
-        name_file = _kb_name_file(kb_id)
-        if name_file.exists():
-            try:
-                kb_name = name_file.read_text(encoding="utf-8").strip()
-            except:
-                pass
-        
-        # 启动统一向量化任务（只启动一次）
         KB_REBUILD_RUNNING.add(safe_id)
         KB_UPLOAD_PROGRESS[safe_id] = {
             "total": 1,
             "processed": 0,
             "done": False,
-            "message": f"已上传 {success_count} 个文件，正在重建索引...",
+            "message": "文件已上传，等待重建索引",
         }
 
-        async def _rebuild() -> None:
-            try:
-                docs = await asyncio.to_thread(_collect_documents_for_kb, files_dir)
-                if not docs:
-                    with KB_UPLOAD_LOCK:
-                        KB_UPLOAD_PROGRESS[safe_id] = {
-                            "total": 0,
-                            "processed": 0,
-                            "done": True,
-                            "message": "知识库未提取到可向量化文本",
-                        }
-                    return
-                embeddings, metadatas = await asyncio.to_thread(_build_embeddings_for_kb_with_progress, docs, safe_id)
-                await asyncio.to_thread(np.save, _kb_index_file(safe_id), embeddings)
-                await asyncio.to_thread(np.save, _kb_meta_file(safe_id), np.array(metadatas, dtype=object))
+    async def _rebuild() -> None:
+        try:
+            docs = await asyncio.to_thread(_collect_documents_for_kb, files_dir)
+            if not docs:
                 with KB_UPLOAD_LOCK:
-                    p = KB_UPLOAD_PROGRESS.get(safe_id, {})
-                    p["done"] = True
-                    p["message"] = f"索引重建完成 ({len(docs)} 个分片)"
-                    KB_UPLOAD_PROGRESS[safe_id] = p
-            except Exception as e:
-                with KB_UPLOAD_LOCK:
-                    p = KB_UPLOAD_PROGRESS.get(safe_id, {"total": 0, "processed": 0})
-                    p["done"] = True
-                    p["message"] = f"索引重建失败: {e}"
-                    KB_UPLOAD_PROGRESS[safe_id] = p
-            finally:
-                with KB_UPLOAD_LOCK:
-                    KB_REBUILD_RUNNING.discard(safe_id)
+                    KB_UPLOAD_PROGRESS[safe_id] = {
+                        "total": 0,
+                        "processed": 0,
+                        "done": True,
+                        "message": "知识库未提取到可向量化文本",
+                    }
+                return
+            embeddings, metadatas = await asyncio.to_thread(_build_embeddings_for_kb_with_progress, docs, safe_id)
+            await asyncio.to_thread(np.save, _kb_index_file(safe_id), embeddings)
+            await asyncio.to_thread(np.save, _kb_meta_file(safe_id), np.array(metadatas, dtype=object))
+            with KB_UPLOAD_LOCK:
+                p = KB_UPLOAD_PROGRESS.get(safe_id, {})
+                p["done"] = True
+                p["message"] = "索引重建完成"
+                KB_UPLOAD_PROGRESS[safe_id] = p
+        except Exception as e:  # noqa: BLE001
+            with KB_UPLOAD_LOCK:
+                p = KB_UPLOAD_PROGRESS.get(safe_id, {"total": 0, "processed": 0})
+                p["done"] = True
+                p["message"] = f"索引重建失败: {e}"
+                KB_UPLOAD_PROGRESS[safe_id] = p
+        finally:
+            with KB_UPLOAD_LOCK:
+                KB_REBUILD_RUNNING.discard(safe_id)
 
-        asyncio.create_task(_rebuild())
-        
-        message = f"成功上传 {success_count}/{len(files)} 个文件"
-        if failed_files:
-            message += f"，{len(failed_files)} 个失败"
-        
-        return BatchUploadResponse(
-            kb_id=kb_id,
-            kb_name=kb_name,
-            total_files=len(files),
-            success_count=success_count,
-            failed_files=failed_files,
-            message=message
-        )
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"批量上传失败: {str(e)}")
+    asyncio.create_task(_rebuild())
+
+    kb_name = _kb_name_file(safe_id).read_text(encoding="utf-8", errors="ignore").strip() or safe_id
+    file_count = len([x for x in files_dir.rglob("*") if x.is_file()])
+    return KnowledgeBaseInfo(id=safe_id, name=kb_name, file_count=file_count)
 
 
 @app.get("/api/kb/{kb_id}/progress", response_model=KnowledgeBaseUploadProgress)
 async def api_kb_progress(kb_id: str) -> KnowledgeBaseUploadProgress:
-    """获取知识库上传/索引进度"""
     safe_id = _safe_kb_id(kb_id)
-    
-    # 安全检查：确保 kb_id 有效（允许空值，因为可能是 legacy 或无任务）
-    if not safe_id:
-        return KnowledgeBaseUploadProgress(
-            total_chunks=0, 
-            processed_chunks=0, 
-            done=True, 
-            message="无效的知识库ID"
-        )
-    
     with KB_UPLOAD_LOCK:
         p = KB_UPLOAD_PROGRESS.get(safe_id)
     if not p:
         return KnowledgeBaseUploadProgress(total_chunks=0, processed_chunks=0, done=True, message="暂无任务")
+
+    # 计算预估剩余时间
+    estimated_remaining = -1
+    total = int(p.get("total", 0))
+    processed = int(p.get("processed", 0))
+    start_time = p.get("start_time")
+    done = bool(p.get("done", False))
+
+    if not done and start_time and processed > 0 and total > processed:
+        elapsed = time.time() - start_time
+        avg_time_per_chunk = elapsed / processed
+        remaining_chunks = total - processed
+        estimated_remaining = int(avg_time_per_chunk * remaining_chunks)
+
     return KnowledgeBaseUploadProgress(
-        total_chunks=int(p.get("total", 0)),
-        processed_chunks=int(p.get("processed", 0)),
-        done=bool(p.get("done", False)),
+        total_chunks=total,
+        processed_chunks=processed,
+        done=done,
         message=str(p.get("message", "")),
+        estimated_remaining_seconds=estimated_remaining,
     )
 
 
 @app.get("/api/kb/{kb_id}/files", response_model=KnowledgeBaseFileListResponse)
 async def api_kb_files(kb_id: str) -> KnowledgeBaseFileListResponse:
-    """获取知识库中的文件列表"""
     safe_id = _safe_kb_id(kb_id)
-    
-    # 安全检查：确保 kb_id 有效
-    if not safe_id:
-        raise HTTPException(
-            status_code=400, 
-            detail="无效的知识库ID"
-        )
-    
     if safe_id == LEGACY_KB_ID:
         if not _legacy_index_exists():
             return KnowledgeBaseFileListResponse(kb_id=safe_id, items=[])
@@ -673,7 +556,6 @@ async def api_kb_files(kb_id: str) -> KnowledgeBaseFileListResponse:
         items = [KnowledgeBaseFileItem(name=n, rel_path=n, size=0) for n in names]
         return KnowledgeBaseFileListResponse(kb_id=safe_id, items=items)
 
-    # 验证知识库目录存在
     base = _kb_dir(safe_id)
     if not base.exists() or not base.is_dir():
         raise HTTPException(status_code=404, detail="知识库不存在")
@@ -692,35 +574,13 @@ async def api_kb_files(kb_id: str) -> KnowledgeBaseFileListResponse:
 
 @app.delete("/api/kb/{kb_id}/file")
 async def api_kb_delete_file(kb_id: str, rel_path: str) -> dict:
-    """删除知识库中的文件
-    
-    安全检查：
-    1. 必须提供有效的 kb_id
-    2. 不能操作默认 legacy_fire 知识库
-    """
     safe_id = _safe_kb_id(kb_id)
-    
-    # 安全检查：确保 kb_id 有效
-    if not safe_id:
-        raise HTTPException(
-            status_code=400, 
-            detail="无效的知识库ID"
-        )
-    
-    # 保护默认知识库
     if safe_id == LEGACY_KB_ID:
-        raise HTTPException(status_code=400, detail="默认「消防」知识库不支持删除文件")
+        raise HTTPException(status_code=400, detail="默认“消防”知识库不支持删除文件")
 
-    # 验证知识库目录存在
     base = _kb_dir(safe_id)
     if not base.exists() or not base.is_dir():
         raise HTTPException(status_code=404, detail="知识库不存在")
-    
-    # 路径安全检查
-    try:
-        base.resolve().relative_to(KB_ROOT_DIR.resolve())
-    except ValueError:
-        raise HTTPException(status_code=400, detail="非法路径")
 
     files_dir = _kb_files_dir(safe_id)
     target = (files_dir / (rel_path or "")).resolve()
@@ -778,54 +638,34 @@ async def api_kb_delete_file(kb_id: str, rel_path: str) -> dict:
 
 @app.delete("/api/kb/{kb_id}")
 async def api_kb_delete(kb_id: str) -> dict:
-    """删除知识库（只能手动删除，保护用户数据）
-    
-    安全检查：
-    1. 必须提供有效的 kb_id
-    2. kb_id 必须是纯数字（由系统生成）
-    3. 不能删除 legacy_fire 默认知识库
-    """
     safe_id = _safe_kb_id(kb_id)
-    
-    # 安全检查：确保 kb_id 有效
-    if not safe_id:
-        raise HTTPException(
-            status_code=400, 
-            detail="无效的知识库ID"
-        )
-    
-    # 保护默认知识库
-    if safe_id == LEGACY_KB_ID:
-        raise HTTPException(
-            status_code=400, 
-            detail="默认「消防」知识库不可删除"
-        )
-    
-    # 取消任何进行中的重建任务
+
     with KB_UPLOAD_LOCK:
         KB_CANCEL_REBUILD.add(safe_id)
         KB_REBUILD_RUNNING.discard(safe_id)
         KB_UPLOAD_PROGRESS.pop(safe_id, None)
 
-    # 验证知识库目录存在
+    if safe_id == LEGACY_KB_ID:
+        removed = False
+        if settings.index_file.exists():
+            settings.index_file.unlink()
+            removed = True
+        if settings.meta_file.exists():
+            settings.meta_file.unlink()
+            removed = True
+        if not removed:
+            raise HTTPException(status_code=404, detail="知识库不存在")
+        return {"ok": True}
+
     base = _kb_dir(safe_id)
     if not base.exists() or not base.is_dir():
         raise HTTPException(status_code=404, detail="知识库不存在")
 
-    # 再次确认：base 必须是 KB_ROOT_DIR 的子目录，防止路径穿越
-    try:
-        base.resolve().relative_to(KB_ROOT_DIR.resolve())
-    except ValueError:
-        raise HTTPException(status_code=400, detail="非法路径")
-
-    # 删除索引文件
     for fp in (_kb_index_file(safe_id), _kb_meta_file(safe_id)):
         if fp.exists():
             fp.unlink()
-    
-    # 删除知识库目录
     shutil.rmtree(base)
-    return {"ok": True, "message": f"知识库已删除"}
+    return {"ok": True}
 
 
 @app.get("/chat-ui", response_class=HTMLResponse)
@@ -1594,6 +1434,8 @@ async def chat_ui() -> str:
                         <div id="plusMenu" class="plus-menu">
                             <button class="plus-item" id="plusBtnCamera" type="button"><span class="plus-icon">📷</span>拍照识文字</button>
                             <button class="plus-item" id="plusBtnImage" type="button"><span class="plus-icon">🖼</span>图片识文字</button>
+                            <button class="plus-item" id="plusBtnAnalyze" type="button"><span class="plus-icon">🔍</span>看图分析</button>
+                            <button class="plus-item" id="plusBtnVideo" type="button"><span class="plus-icon">🎬</span>视频分析</button>
                             <button class="plus-item" id="plusBtnFile" type="button"><span class="plus-icon">📎</span>文件</button>
                         </div>
                     </div>
@@ -1635,6 +1477,8 @@ async def chat_ui() -> str:
     <input type="file" id="kbFileInput" accept=".txt,.md,.pdf,.docx,.jpg,.jpeg,.png,.bmp,.webp,.gif" multiple style="display:none" />
     <input type="file" id="fileCamera" accept="image/*" capture="environment" style="display:none" />
     <input type="file" id="fileImage" accept="image/*" multiple style="display:none" />
+    <input type="file" id="fileAnalyze" accept="image/*" style="display:none" />
+    <input type="file" id="fileVideo" accept="video/*" style="display:none" />
     <input type="file" id="fileDoc" accept=".txt,.md,.pdf,.docx,.jpg,.jpeg,.png,.bmp,.webp,.gif" multiple style="display:none" />
     <script>
         const chatBox = document.getElementById('chatBox');
@@ -1646,9 +1490,13 @@ async def chat_ui() -> str:
         const plusMenu = document.getElementById('plusMenu');
         const plusBtnCamera = document.getElementById('plusBtnCamera');
         const plusBtnImage = document.getElementById('plusBtnImage');
+        const plusBtnAnalyze = document.getElementById('plusBtnAnalyze');
+        const plusBtnVideo = document.getElementById('plusBtnVideo');
         const plusBtnFile = document.getElementById('plusBtnFile');
         const fileCamera = document.getElementById('fileCamera');
         const fileImage = document.getElementById('fileImage');
+        const fileAnalyze = document.getElementById('fileAnalyze');
+        const fileVideo = document.getElementById('fileVideo');
         const fileDoc = document.getElementById('fileDoc');
         const attachmentStrip = document.getElementById('attachmentStrip');
         const menuBtn = document.getElementById('menuBtn');
@@ -1718,7 +1566,7 @@ async def chat_ui() -> str:
         function setKbFileRowProgress(kbId, percent, message) {
             if (!kbLinkedPanel || !kbLinkedPanel.classList.contains('open')) return;
             if (!kbDetailOpenForId || kbDetailOpenForId !== kbId) return;
-            var rows = kbLinkedList ? kbLinkedList.querySelectorAll('.kb-file-row') : [];
+            var rows = kbLinkedList ? kbLinkedList.querySelectorAll('.kb-file-row[data-kb-id="' + kbId + '"]') : [];
             var p = Math.max(0, Math.min(100, Number(percent || 0)));
             for (var i = 0; i < rows.length; i++) {
                 rows[i].style.setProperty('--fill', p + '%');
@@ -1931,7 +1779,7 @@ async def chat_ui() -> str:
                     uploadBtn.disabled = kb.id === 'legacy_fire';
                     uploadBtn.addEventListener('click', function () {
                         if (kb.id === 'legacy_fire') {
-                            setStatus('"消防"为默认知识库，不支持上传');
+                            setStatus('“消防”为默认知识库，不支持上传');
                             return;
                         }
                         kbUploadTargetId = kb.id;
@@ -2035,6 +1883,7 @@ async def chat_ui() -> str:
                     (function (f) {
                         var row = document.createElement('div');
                         row.className = 'kb-file-row';
+                        row.dataset.kbId = kb.id;
 
                         var top = document.createElement('div');
                         top.className = 'kb-file-row-top';
@@ -2199,23 +2048,6 @@ async def chat_ui() -> str:
                     row.appendChild(delBtn);
                     historyList.appendChild(row);
                 })(sessions[si]);
-            }
-        }
-
-        function updateSessionTitle(id, newTitle) {
-            var all = loadAllSessionsFromStorage();
-            for (var i = 0; i < all.length; i++) {
-                if (all[i].id === id) {
-                    all[i].title = newTitle;
-                    all[i].updatedAt = Date.now();
-                    break;
-                }
-            }
-            saveAllSessionsToStorage(all);
-            // 如果是当前会话，也更新内存中的标题
-            if (id === currentSessionId) {
-                var titleEl = document.getElementById('currentSessionTitle');
-                if (titleEl) titleEl.textContent = newTitle;
             }
         }
 
@@ -2561,25 +2393,6 @@ async def chat_ui() -> str:
             setSendBtnBusy(true);
             setStatus('检索中');
 
-            // 调用总结API更新历史标题
-            let summaryUpdated = false;
-            try {
-                const summaryResp = await fetch(apiUrl('/api/summarize'), {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ question: q })
-                });
-                if (summaryResp.ok) {
-                    const summaryData = await summaryResp.json();
-                    if (summaryData.summary && currentSessionId) {
-                        updateSessionTitle(currentSessionId, summaryData.summary);
-                        summaryUpdated = true;
-                    }
-                }
-            } catch (e) {
-                // 忽略总结API的错误，不影响主流程
-            }
-
             try {
                 let resp;
                 try {
@@ -2737,6 +2550,19 @@ async def chat_ui() -> str:
             }
         }
 
+        function _fmtRemainingTime(seconds) {
+            if (!seconds || seconds < 0) return '';
+            if (seconds < 60) return '约 ' + seconds + '秒';
+            if (seconds < 3600) {
+                var m = Math.floor(seconds / 60);
+                var s = seconds % 60;
+                return '约 ' + m + '分' + (s > 0 ? s + '秒' : '');
+            }
+            var h = Math.floor(seconds / 3600);
+            var m = Math.floor((seconds % 3600) / 60);
+            return '约 ' + h + '小时' + (m > 0 ? m + '分' : '');
+        }
+
         async function waitKbRebuildProgress(kbId, persistTracking) {
             if (persistTracking) saveUploadTracking(kbId);
             var maxLoop = 360;
@@ -2759,10 +2585,15 @@ async def chat_ui() -> str:
                 var total = Number(data.total_chunks || 0);
                 var done = Number(data.processed_chunks || 0);
                 var msg = data.message || '';
+                var remaining = data.estimated_remaining_seconds;
+                var remainingText = _fmtRemainingTime(remaining);
                 if (total > 0) {
                     var p = Math.max(0, Math.min(100, Math.round(done * 100 / total)));
-                    setStatus('分片处理中：' + done + '/' + total + '（' + p + '%）' + (msg ? ' - ' + msg : ''));
-                    setKbFileRowProgress(kbId, p, msg);
+                    var statusText = '分片处理中：' + done + '/' + total + '（' + p + '%）';
+                    if (remainingText) statusText += '，剩余 ' + remainingText;
+                    if (msg) statusText += ' - ' + msg;
+                    setStatus(statusText);
+                    setKbFileRowProgress(kbId, p, statusText);
                 } else {
                     setStatus(msg || '分片处理中…');
                     setKbFileRowProgress(kbId, 0, msg);
@@ -2797,145 +2628,6 @@ async def chat_ui() -> str:
             }
         }
 
-        // 智能上传：自动选择最佳上传方式
-        // 大文件或多个文件时使用并行上传，小文件使用批量API
-        async function uploadFilesBatch(kbId, files) {
-            // 大文件阈值：超过此大小启用并行上传
-            var LARGE_FILE_THRESHOLD = 100 * 1024 * 1024; // 100MB
-            
-            // 检查是否有大文件或多个文件
-            var hasLargeFile = false;
-            var totalSize = 0;
-            
-            for (var i = 0; i < files.length; i++) {
-                totalSize += files[i].size;
-                if (files[i].size > LARGE_FILE_THRESHOLD) {
-                    hasLargeFile = true;
-                }
-            }
-            
-            // 如果有大文件或超过3个小文件，使用并行上传
-            if (hasLargeFile || files.length > 3) {
-                return await uploadFilesInParallel(kbId, files);
-            }
-            
-            // 否则使用批量上传API
-            return await uploadFilesBatchAPI(kbId, files);
-        }
-        
-        // 批量上传API（单连接，适合小文件）
-        async function uploadFilesBatchAPI(kbId, files) {
-            return new Promise(function (resolve, reject) {
-                var xhr = new XMLHttpRequest();
-                xhr.open('POST', apiUrl('/api/kb/upload/batch'));
-                xhr.responseType = 'json';
-
-                xhr.upload.onprogress = function (evt) {
-                    if (evt.lengthComputable && evt.total > 0) {
-                        var p = Math.round((evt.loaded / evt.total) * 100);
-                        setStatus('上传中（' + files.length + '个文件）：' + p + '%');
-                    } else {
-                        setStatus('上传中（' + files.length + '个文件）...');
-                    }
-                };
-
-                xhr.onload = function () {
-                    var data = xhr.response;
-                    if (!data && xhr.responseText) {
-                        try { data = JSON.parse(xhr.responseText); } catch (e) {}
-                    }
-                    if (xhr.status >= 200 && xhr.status < 300) {
-                        resolve(data || {});
-                    } else {
-                        reject(new Error((data && data.detail) ? data.detail : ('HTTP ' + xhr.status)));
-                    }
-                };
-
-                xhr.onerror = function () {
-                    reject(new Error('网络错误，上传失败'));
-                };
-
-                var fd = new FormData();
-                fd.append('kb_id', kbId);
-                for (var i = 0; i < files.length; i++) {
-                    fd.append('files', files[i], files[i].name);
-                }
-                xhr.send(fd);
-            });
-        }
-        
-        // 真正的并行上传（多连接，显著提升大文件速度）
-        async function uploadFilesInParallel(kbId, files) {
-            var MAX_CONCURRENT = 3; // 最多3个并发连接
-            var results = [];
-            var totalBytes = 0;
-            var uploadedBytes = 0;
-            
-            // 计算总大小
-            for (var i = 0; i < files.length; i++) {
-                totalBytes += files[i].size;
-            }
-            
-            function uploadSingleFile(file) {
-                return new Promise(function(resolve, reject) {
-                    var xhr = new XMLHttpRequest();
-                    xhr.open('POST', apiUrl('/api/kb/upload'));
-                    xhr.responseType = 'json';
-                    
-                    var fileUploaded = 0;
-                    
-                    xhr.upload.onprogress = function(evt) {
-                        if (evt.lengthComputable && evt.total > 0) {
-                            var delta = evt.loaded - fileUploaded;
-                            fileUploaded = evt.loaded;
-                            uploadedBytes += delta;
-                            var p = Math.round((uploadedBytes / totalBytes) * 100);
-                            setStatus('并行上传中：' + p + '%（' + files.length + '个文件）');
-                        }
-                    };
-                    
-                    xhr.onload = function() {
-                        var data = xhr.response;
-                        if (!data && xhr.responseText) {
-                            try { data = JSON.parse(xhr.responseText); } catch (e) {}
-                        }
-                        if (xhr.status >= 200 && xhr.status < 300) {
-                            resolve(data || {});
-                        } else {
-                            reject(new Error((data && data.detail) ? data.detail : ('HTTP ' + xhr.status)));
-                        }
-                    };
-                    
-                    xhr.onerror = function() {
-                        reject(new Error('网络错误，上传失败: ' + file.name));
-                    };
-                    
-                    var fd = new FormData();
-                    fd.append('kb_id', kbId);
-                    fd.append('file', file, file.name);
-                    xhr.send(fd);
-                });
-            }
-            
-            // 分批并行上传
-            for (var i = 0; i < files.length; i += MAX_CONCURRENT) {
-                var batch = files.slice(i, i + MAX_CONCURRENT);
-                var batchPromises = batch.map(function(file) {
-                    return uploadSingleFile(file);
-                });
-                
-                var batchResults = await Promise.all(batchPromises);
-                results = results.concat(batchResults);
-            }
-            
-            return {
-                kb_id: kbId,
-                success: true,
-                message: '成功上传 ' + results.length + ' 个文件（并行模式）',
-                uploaded_files: results.length
-            };
-        }
-
         if (kbFileInput) {
             kbFileInput.addEventListener('change', async function (e) {
                 var files = Array.from(e.target.files || []);
@@ -2947,25 +2639,28 @@ async def chat_ui() -> str:
                 }
 
                 var total = files.length;
+                var ok = 0;
+                var lastData = null;
                 try {
-                    setStatus('开始上传 ' + total + ' 个文件（并行）...');
-                    
-                    // 使用批量上传API
-                    var result = await uploadFilesBatch(kbUploadTargetId, files);
-                    
-                    // 等待向量化完成
-                    if (result.kb_id) {
-                        selectedKbId = result.kb_id;
-                        localStorage.setItem(KB_SELECTED_KEY, selectedKbId);
-                        setStatus(result.message || '文件上传成功，正在处理...');
-                        await waitKbRebuildProgress(result.kb_id, true);
+                    for (var i = 0; i < files.length; i++) {
+                        var f = files[i];
+                        var idx = i + 1;
+                        setStatus('准备上传（' + idx + '/' + total + '）：' + f.name);
+                        var data = await uploadKbFileWithProgress(kbUploadTargetId, f, idx, total);
+                        lastData = data;
+                        ok++;
+                        await waitKbRebuildProgress(kbUploadTargetId, true);
                     }
-                    
+
+                    if (lastData && lastData.id) {
+                        selectedKbId = lastData.id;
+                        localStorage.setItem(KB_SELECTED_KEY, selectedKbId);
+                    }
                     await refreshKbListAndRender();
-                    setStatus(result.message || '知识库导入完成');
+                    setStatus('知识库导入完成：成功 ' + ok + ' / ' + total);
                 } catch (err) {
                     await refreshKbListAndRender();
-                    setStatus('知识库导入失败：' + (err.message || err));
+                    setStatus('知识库导入中断：已成功 ' + ok + ' / ' + total + '，原因：' + (err.message || err));
                 } finally {
                     kbUploadTargetId = null;
                 }
@@ -3040,6 +2735,22 @@ async def chat_ui() -> str:
                 fileDoc.click();
             });
         }
+        if (plusBtnAnalyze && fileAnalyze) {
+            plusBtnAnalyze.addEventListener('click', function (e) {
+                e.preventDefault();
+                e.stopPropagation();
+                hidePlusMenu();
+                fileAnalyze.click();
+            });
+        }
+        if (plusBtnVideo && fileVideo) {
+            plusBtnVideo.addEventListener('click', function (e) {
+                e.preventDefault();
+                e.stopPropagation();
+                hidePlusMenu();
+                fileVideo.click();
+            });
+        }
 
         if (fileCamera) fileCamera.addEventListener('change', async function (e) {
             const f = e.target.files && e.target.files[0];
@@ -3070,6 +2781,172 @@ async def chat_ui() -> str:
             }
             if (ok > 0) setStatus('已导入 ' + ok + ' 张图片');
         });
+
+        // 看图分析：上传图片并输入问题，调用多模态RAG
+        if (fileAnalyze) fileAnalyze.addEventListener('change', async function (e) {
+            const f = e.target.files && e.target.files[0];
+            e.target.value = '';
+            if (!f) return;
+
+            // 弹出问题输入框
+            var question = window.prompt('请输入您的问题（可选，不填则自动分析图片）：\n\n例如：\n- 我的乒乓球姿势哪里不对？\n- 这张图片里有什么？\n- 这个动作规范吗？', '');
+            if (question === null) {
+                setStatus('已取消');
+                return;
+            }
+            question = (question || '').trim();
+
+            setStatus('分析图片中…');
+
+            // 创建预览
+            const previewUrl = URL.createObjectURL(f);
+
+            // 添加用户消息
+            var userShow = question || '（请分析这张图片）';
+            appendMessage('user', userShow + '\n\n[图片]', []);
+
+            // 显示图片预览
+            if (welcomeText) welcomeText.style.display = 'none';
+
+            // 调用多模态聊天API
+            chatAbortController = new AbortController();
+            chatInFlight = true;
+            setSendBtnBusy(true);
+
+            try {
+                const fd = new FormData();
+                fd.append('file', f, f.name);
+                fd.append('question', question || '请详细描述这张图片的内容');
+                fd.append('kb_id', selectedKbId || '');
+                fd.append('selected_files', selectedKbId ? (getSelectedFilesForKb(selectedKbId) || []).join(',') : '');
+
+                const resp = await fetch(apiUrl('/chat/vision'), {
+                    method: 'POST',
+                    body: fd,
+                    signal: chatAbortController.signal,
+                });
+
+                if (!resp.ok) {
+                    const data = await resp.json().catch(() => ({}));
+                    const msg = (data && data.detail) ? data.detail : ('HTTP ' + resp.status);
+                    throw new Error(msg);
+                }
+
+                const data = await resp.json();
+
+                // 显示AI回答
+                var botContexts = [];
+                if (data.contexts && data.contexts.length > 0) {
+                    botContexts = data.contexts;
+                }
+                appendMessage('assistant', data.answer, botContexts);
+
+                // 显示图片分析详情（如果有知识库）
+                if (data.image_analysis && data.contexts && data.contexts.length > 0) {
+                    setStatus('分析完成，已结合知识库给出回答');
+                } else {
+                    setStatus('分析完成');
+                }
+
+            } catch (err) {
+                if (err && err.name === 'AbortError') {
+                    appendMessage('assistant', '（已停止）', []);
+                    setStatus('已停止');
+                } else {
+                    console.error(err);
+                    appendMessage('assistant', '图片分析失败：' + (err.message || err), []);
+                    setStatus('分析失败：' + (err.message || err));
+                }
+            } finally {
+                chatInFlight = false;
+                chatAbortController = null;
+                setSendBtnBusy(false);
+                if (previewUrl) URL.revokeObjectURL(previewUrl);
+            }
+        });
+
+        // 视频分析：上传视频并输入问题，提取帧后调用多模态RAG
+        if (fileVideo) fileVideo.addEventListener('change', async function (e) {
+            const f = e.target.files && e.target.files[0];
+            e.target.value = '';
+            if (!f) return;
+
+            // 弹出问题输入框
+            var question = window.prompt('请输入您关于视频的问题（可选）：\n\n例如：\n- 我的发球动作规范吗？\n- 这个动作哪里需要改进？\n- 请分析视频中的人物动作', '');
+            if (question === null) {
+                setStatus('已取消');
+                return;
+            }
+            question = (question || '').trim();
+
+            setStatus('正在提取视频帧…');
+
+            // 添加用户消息
+            var userShow = question || '（请分析这个视频）';
+            appendMessage('user', userShow + '\n\n[视频文件: ' + f.name + ']', []);
+
+            if (welcomeText) welcomeText.style.display = 'none';
+
+            chatAbortController = new AbortController();
+            chatInFlight = true;
+            setSendBtnBusy(true);
+
+            try {
+                const fd = new FormData();
+                fd.append('file', f, f.name);
+                fd.append('question', question || '请详细描述视频中的动作和事件');
+                fd.append('kb_id', selectedKbId || '');
+                fd.append('selected_files', selectedKbId ? (getSelectedFilesForKb(selectedKbId) || []).join(',') : '');
+                fd.append('num_frames', '4');
+
+                setStatus('分析视频中（这可能需要一些时间）…');
+
+                const resp = await fetch(apiUrl('/chat/video'), {
+                    method: 'POST',
+                    body: fd,
+                    signal: chatAbortController.signal,
+                });
+
+                if (!resp.ok) {
+                    const data = await resp.json().catch(() => ({}));
+                    const msg = (data && data.detail) ? data.detail : ('HTTP ' + resp.status);
+                    throw new Error(msg);
+                }
+
+                const data = await resp.json();
+
+                var botContexts = [];
+                if (data.contexts && data.contexts.length > 0) {
+                    botContexts = data.contexts;
+                }
+                appendMessage('assistant', data.answer, botContexts);
+
+                if (data.contexts && data.contexts.length > 0) {
+                    setStatus('视频分析完成，已结合知识库给出回答');
+                } else {
+                    setStatus('视频分析完成');
+                }
+
+            } catch (err) {
+                if (err && err.name === 'AbortError') {
+                    appendMessage('assistant', '（已停止）', []);
+                    setStatus('已停止');
+                } else {
+                    console.error(err);
+                    var errMsg = err.message || String(err);
+                    if (errMsg.includes('OpenCV')) {
+                        errMsg = '视频分析需要安装 OpenCV。请在命令行运行: pip install opencv-python';
+                    }
+                    appendMessage('assistant', '视频分析失败：' + errMsg, []);
+                    setStatus('分析失败：' + errMsg);
+                }
+            } finally {
+                chatInFlight = false;
+                chatAbortController = null;
+                setSendBtnBusy(false);
+            }
+        });
+
         if (fileDoc) fileDoc.addEventListener('change', async function (e) {
             const files = Array.from((e.target.files || []));
             e.target.value = '';
@@ -3108,8 +2985,6 @@ def _effective_rag_query(question: str, attachment_text: str) -> str:
 
 
 @app.post("/chat", response_model=ChatResponse)
-@timed(name="聊天接口")
-@cached(ttl=60)  # 缓存1分钟，相同的查询可以快速返回
 async def chat(body: ChatRequest) -> ChatResponse:
     """核心聊天接口：接收问题，返回回答和参考片段。"""
     q = (body.question or "").strip()
@@ -3154,58 +3029,231 @@ async def chat(body: ChatRequest) -> ChatResponse:
     return ChatResponse(answer=answer, contexts=contexts)
 
 
-class SummarizeRequest(BaseModel):
-    """问题总结请求"""
-    question: str = Field(..., description="用户问题")
+@app.post("/chat/vision", response_model=VisionChatResponse)
+async def chat_vision(
+    file: UploadFile = File(...),
+    question: str = Form(""),
+    kb_id: Optional[str] = Form(None),
+    selected_files: Optional[str] = Form(None),
+) -> VisionChatResponse:
+    """看图分析聊天接口：上传图片，结合问题分析图片并从知识库获取相关信息。
+    
+    使用方法：
+    - 上传图片文件
+    - 填写问题（如"我的乒乓球姿势哪里不对？"）
+    - 可选关联知识库ID进行RAG增强
+    """
+    from rag_service import multimodal_rag_answer
 
+    # 验证文件
+    if not file.filename:
+        raise HTTPException(status_code=400, detail="请上传图片文件")
+    
+    # 读取图片数据
+    image_bytes = await file.read()
+    if len(image_bytes) == 0:
+        raise HTTPException(status_code=400, detail="图片文件为空")
+    
+    # 限制图片大小（20MB）
+    MAX_IMAGE_SIZE = 20 * 1024 * 1024
+    if len(image_bytes) > MAX_IMAGE_SIZE:
+        raise HTTPException(status_code=413, detail="图片过大，请压缩后重试（最大20MB）")
 
-class SummarizeResponse(BaseModel):
-    """问题总结响应"""
-    summary: str = Field(..., description="总结后的标题")
-
-
-@app.post("/api/summarize", response_model=SummarizeResponse)
-@timed(name="问题总结接口")
-async def summarize_question(body: SummarizeRequest) -> SummarizeResponse:
-    """将用户问题总结为简洁的标题"""
-    q = (body.question or "").strip()
+    q = (question or "").strip()
     if not q:
-        return SummarizeResponse(summary="新对话")
+        q = "请详细描述这张图片的内容"
 
     try:
-        # 调用通义千问API进行总结
-        from config import settings
-        import dashscope
-        dashscope.api_key = settings.dashscope_api_key
+        # 解析选定的文件列表
+        sel_files = []
+        if selected_files:
+            try:
+                sel_files = [f.strip() for f in selected_files.split(",") if f.strip()]
+            except Exception:
+                pass
 
-        prompt = f"""请将下面的用户问题总结为一个简洁的中文标题（不超过20个字），只返回标题，不要加引号或其他符号：
+        resolved_kb = _resolve_rag_kb_id(kb_id)
 
-问题：{q}
+        # 调用多模态RAG
+        answer, contexts_raw, image_analysis = multimodal_rag_answer(
+            query=q,
+            image_bytes=image_bytes,
+            filename=file.filename,
+            kb_id=resolved_kb,
+            selected_files=sel_files,
+        )
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e)) from e
 
-标题："""
-
-        response = dashscope.Generation.call(
-            model=dashscope.Generation.Models.qwen_turbo,
-            prompt=prompt,
-            max_tokens=50,
-            temperature=0.3,
-            result_format='message',
+    contexts: List[ContextSnippet] = []
+    for c in contexts_raw:
+        text = c.get("text", "") or ""
+        if len(text) > 200:
+            text = text[:200] + "..."
+        contexts.append(
+            ContextSnippet(
+                source=str(c.get("source", "")),
+                text_preview=text,
+                score=float(c.get("score", 0.0)),
+            )
         )
 
-        if response.status_code == 200:
-            summary = response.output.choices[0].message.content.strip()
-            # 清理标题：移除可能的引号和空白
-            summary = summary.strip('"\'。').strip()
-            if len(summary) > 20:
-                summary = summary[:20] + "…"
-            return SummarizeResponse(summary=summary)
-        else:
-            # API调用失败，使用默认逻辑
-            summary = q[:20] + "…" if len(q) > 20 else q
-            return SummarizeResponse(summary=summary)
+    return VisionChatResponse(
+        answer=answer,
+        contexts=contexts,
+        image_analysis=image_analysis,
+    )
 
+
+@app.post("/api/analyze/image", response_model=OCRImageResponse)
+async def api_analyze_image(file: UploadFile = File(...)) -> OCRImageResponse:
+    """看图分析接口：上传图片，使用多模态模型分析图片内容（不结合知识库）。
+    
+    返回图片的详细描述，适合用户想了解图片中有什么的场景。
+    """
+    from rag_service import analyze_image
+
+    if not file.filename:
+        raise HTTPException(status_code=400, detail="请上传图片文件")
+
+    image_bytes = await file.read()
+    if len(image_bytes) == 0:
+        raise HTTPException(status_code=400, detail="图片文件为空")
+
+    MAX_IMAGE_SIZE = 20 * 1024 * 1024
+    if len(image_bytes) > MAX_IMAGE_SIZE:
+        raise HTTPException(status_code=413, detail="图片过大，请压缩后重试（最大20MB）")
+
+    try:
+        analysis = analyze_image(
+            image_bytes,
+            file.filename,
+            question="请详细描述这张图片的所有内容，包括：\n1. 主体是什么（人物/物品/场景）\n2. 主要特征和细节\n3. 如果是人物动作，请描述姿势、表情、动作要领\n4. 任何值得注意的点"
+        )
     except Exception as e:
-        # 出错时使用默认逻辑
-        summary = q[:20] + "…" if len(q) > 20 else q
-        return SummarizeResponse(summary=summary)
+        raise HTTPException(status_code=422, detail=f"图片分析失败: {e}") from e
+
+    return OCRImageResponse(text=analysis, filename=file.filename)
+
+
+@app.post("/chat/video", response_model=VisionChatResponse)
+async def chat_video(
+    file: UploadFile = File(...),
+    question: str = Form(""),
+    kb_id: Optional[str] = Form(None),
+    selected_files: Optional[str] = Form(None),
+    num_frames: int = Form(4),
+) -> VisionChatResponse:
+    """视频分析聊天接口：上传视频，提取关键帧分析并结合知识库回答。
+
+    使用方法：
+    - 上传视频文件（mp4, avi, mov等）
+    - 填写问题（如"我的发球动作规范吗？"）
+    - 可选关联知识库ID进行RAG增强
+    """
+    from rag_service import multimodal_video_rag_answer
+
+    if not file.filename:
+        raise HTTPException(status_code=400, detail="请上传视频文件")
+
+    # 读取视频数据
+    video_bytes = await file.read()
+    if len(video_bytes) == 0:
+        raise HTTPException(status_code=400, detail="视频文件为空")
+
+    # 限制视频大小（100MB）
+    MAX_VIDEO_SIZE = 100 * 1024 * 1024
+    if len(video_bytes) > MAX_VIDEO_SIZE:
+        raise HTTPException(status_code=413, detail="视频过大，请压缩后重试（最大100MB）")
+
+    q = (question or "").strip()
+    if not q:
+        q = "请描述视频中发生了什么，动作是否规范"
+
+    # 限制帧数
+    num_frames = min(max(1, num_frames), 8)
+
+    try:
+        sel_files = []
+        if selected_files:
+            try:
+                sel_files = [f.strip() for f in selected_files.split(",") if f.strip()]
+            except Exception:
+                pass
+
+        resolved_kb = _resolve_rag_kb_id(kb_id)
+
+        answer, contexts_raw, video_analysis = multimodal_video_rag_answer(
+            query=q,
+            video_bytes=video_bytes,
+            filename=file.filename,
+            kb_id=resolved_kb,
+            selected_files=sel_files,
+            num_frames=num_frames,
+        )
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e)) from e
+    except RuntimeError as e:
+        raise HTTPException(status_code=422, detail=str(e)) from e
+
+    contexts: List[ContextSnippet] = []
+    for c in contexts_raw:
+        text = c.get("text", "") or ""
+        if len(text) > 200:
+            text = text[:200] + "..."
+        contexts.append(
+            ContextSnippet(
+                source=str(c.get("source", "")),
+                text_preview=text,
+                score=float(c.get("score", 0.0)),
+            )
+        )
+
+    return VisionChatResponse(
+        answer=answer,
+        contexts=contexts,
+        image_analysis=video_analysis,
+    )
+
+
+@app.post("/api/analyze/video", response_model=OCRImageResponse)
+async def api_analyze_video(
+    file: UploadFile = File(...),
+    num_frames: int = Form(4),
+) -> OCRImageResponse:
+    """视频分析接口：上传视频，提取关键帧分析内容（不结合知识库）。
+
+    返回视频的详细描述和动作分析。
+    """
+    from rag_service import extract_video_frames, analyze_video_frames
+
+    if not file.filename:
+        raise HTTPException(status_code=400, detail="请上传视频文件")
+
+    video_bytes = await file.read()
+    if len(video_bytes) == 0:
+        raise HTTPException(status_code=400, detail="视频文件为空")
+
+    MAX_VIDEO_SIZE = 100 * 1024 * 1024
+    if len(video_bytes) > MAX_VIDEO_SIZE:
+        raise HTTPException(status_code=413, detail="视频过大，请压缩后重试（最大100MB）")
+
+    # 限制帧数
+    num_frames = min(max(1, num_frames), 8)
+
+    try:
+        frames = extract_video_frames(video_bytes, file.filename, num_frames)
+        analysis = analyze_video_frames(
+            frames,
+            question="请详细描述视频中的内容：\n1. 主要动作或事件\n2. 动作的连贯性和节奏\n3. 如果是体育动作，请分析姿势是否规范\n4. 任何值得注意的细节"
+        )
+    except Exception as e:
+        raise HTTPException(status_code=422, detail=f"视频分析失败: {e}") from e
+
+    return OCRImageResponse(text=analysis, filename=file.filename)
+
+
+
+
+
 
