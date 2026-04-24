@@ -1,0 +1,17 @@
+{
+  "pages": [
+    {"number": 1, "type": "cover", "title": "多模态RAG知识问答系统"},
+    {"number": 2, "type": "table_of_contents", "title": "目录"},
+    {"number": 3, "type": "chapter", "title": "01 项目背景"},
+    {"number": 4, "type": "content", "title": "问题与痛点"},
+    {"number": 5, "type": "chapter", "title": "02 核心功能"},
+    {"number": 6, "type": "content", "title": "多格式文档解析"},
+    {"number": 7, "type": "content", "title": "资料库可更换架构"},
+    {"number": 8, "type": "content", "title": "智能问答流程"},
+    {"number": 9, "type": "content", "title": "多模态内容理解"},
+    {"number": 10, "type": "chapter", "title": "03 技术优势"},
+    {"number": 11, "type": "content", "title": "系统性能监控"},
+    {"number": 12, "type": "content", "title": "应用场景"},
+    {"number": 13, "type": "final", "title": "感谢聆听"}
+  ]
+}

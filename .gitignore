@@ -36,3 +36,14 @@ uploads/
 
 # 本地打包备份
 打包上传/
+
+# 前端依赖
+node_modules/
+
+# 解压临时目录
+unpack_1/
+unpack_2/
+unpack_3/
+
+# Workbuddy 本地数据
+.workbuddy/

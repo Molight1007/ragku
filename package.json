@@ -1,0 +1,27 @@
+{
+  "name": "ragku",
+  "version": "1.0.0",
+  "description": "本项目是面向「全国大学生计算机设计大赛」AI方向的 **多模态知识问答系统** 原型，实现从本地知识库文件夹（如 `D:\\知识库资料20`）构建检索增强生成（RAG）能力，并调用阿里云通义千问大模型进行问答与分析。",
+  "main": "create_filled_forms.js",
+  "directories": {
+    "doc": "docs"
+  },
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Molight1007/ragku.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "bugs": {
+    "url": "https://github.com/Molight1007/ragku/issues"
+  },
+  "homepage": "https://github.com/Molight1007/ragku#readme",
+  "dependencies": {
+    "docx": "^9.6.1"
+  }
+}
