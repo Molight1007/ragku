@@ -1,7 +1,7 @@
 @echo off
 chcp 65001 >nul
 title RAG启动器 - 正在打包...
-cd /d "%~dp0.."
+cd /d "%~dp0"
 echo ==========================================
 echo   RAG启动器 打包脚本
 echo ==========================================
@@ -23,7 +23,7 @@ echo 开始打包，请稍候...
 echo.
 
 REM 执行打包
-pyinstaller "RAG启动器.spec" --clean
+pyinstaller "RAG启动器.spec" --clean -y
 
 echo.
 if exist "dist\RAG启动器\RAG启动器.exe" (

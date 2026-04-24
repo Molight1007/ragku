@@ -33,3 +33,6 @@ index_meta.npy
 
 # 本地上传
 uploads/
+
+# 本地打包备份
+打包上传/

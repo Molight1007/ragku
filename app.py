@@ -1432,11 +1432,11 @@ async def chat_ui() -> str:
                     <div class="plus-wrap">
                         <button id="plusBtn" class="plus-btn" type="button" aria-label="更多功能">+</button>
                         <div id="plusMenu" class="plus-menu">
-                            <button class="plus-item" id="plusBtnCamera" type="button"><span class="plus-icon">📷</span>拍照识文字</button>
-                            <button class="plus-item" id="plusBtnImage" type="button"><span class="plus-icon">🖼</span>图片识文字</button>
+                            <button class="plus-item" id="plusBtnCamera" type="button"><span class="plus-icon">📷</span>拍照提问</button>
+                            <button class="plus-item" id="plusBtnImage" type="button"><span class="plus-icon">🖼</span>对图片提问</button>
                             <button class="plus-item" id="plusBtnAnalyze" type="button"><span class="plus-icon">🔍</span>看图分析</button>
                             <button class="plus-item" id="plusBtnVideo" type="button"><span class="plus-icon">🎬</span>视频分析</button>
-                            <button class="plus-item" id="plusBtnFile" type="button"><span class="plus-icon">📎</span>文件</button>
+                            <button class="plus-item" id="plusBtnFile" type="button"><span class="plus-icon">📎</span>对文件提问</button>
                         </div>
                     </div>
                     <button id="sendBtn" class="send-btn" type="button" aria-label="发送">↑</button>
